@@ -15,13 +15,22 @@ package utils
 
 import (
 	"compress/gzip"
+	"crypto/md5"
 	"flag"
 	"fmt"
+	jsoniter "github.com/json-iterator/go"
+	uuid "github.com/satori/go.uuid"
+	"github.com/tickstep/aliyunpan-api/aliyunpan"
 	"github.com/tickstep/library-go/ids"
 	"io"
 	"io/ioutil"
+	"math"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"path"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -160,4 +169,115 @@ func GetUniqueKeyStr() string {
 		keyStr = "AE8627B0296A4126A1434999C45ECAB2"
 	}
 	return keyStr
+}
+
+// PathExists 文件路径是否存在
+func PathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// ObjectToJsonStr 转换成json字符串
+func ObjectToJsonStr(v interface{}, useIndent bool) string {
+	r := ""
+	if useIndent {
+		if data, err := jsoniter.MarshalIndent(v, "", " "); err == nil {
+			r = string(data)
+		}
+	} else {
+		if data, err := jsoniter.MarshalIndent(v, "", ""); err == nil {
+			r = string(data)
+		}
+
+	}
+	return r
+}
+
+func UuidStr() string {
+	u4 := uuid.NewV4()
+	return u4.String()
+}
+
+// NowTimeStr 当前时间字符串，格式为：2006-01-02 15:04:05
+func NowTimeStr() string {
+	return time.Now().Format("2006-01-02 15:04:05")
+}
+
+func defaultZeroTime() time.Time {
+	value := "1971-01-01 08:00:00"
+	cz := time.FixedZone("CST", 8*3600) // 东8区
+	if t, e := time.ParseInLocation("2006-01-02 15:04:05", value, cz); e == nil {
+		return t
+	}
+	return time.Time{}
+}
+
+// ParseTimeStr 反解析时间字符串
+func ParseTimeStr(value string) time.Time {
+	cz := time.FixedZone("CST", 8*3600) // 东8区
+	if t, e := time.ParseInLocation("2006-01-02 15:04:05", value, cz); e == nil {
+		return t
+	}
+	return defaultZeroTime()
+}
+
+// Md5Str MD5哈希计算
+func Md5Str(text string) string {
+	h := md5.New()
+	h.Write([]byte(text))
+	re := h.Sum(nil)
+	sb := &strings.Builder{}
+	fmt.Fprintf(sb, "%x", re)
+	return strings.ToLower(sb.String())
+}
+
+// IsLocalAbsPath 是否是本地绝对路径
+func IsLocalAbsPath(filePath string) bool {
+	if runtime.GOOS == "windows" {
+		// 是否是windows路径
+		matched, _ := regexp.MatchString("^([a-zA-Z]:)", filePath)
+		if matched {
+			// windows volume label
+			return true
+		}
+		return false
+	} else {
+		return path.IsAbs(filePath)
+	}
+}
+
+// IsPanAbsPath 是否是云盘绝对路径
+func IsPanAbsPath(filePath string) bool {
+	return path.IsAbs(filePath)
+}
+
+// IsExcludeFile 是否是指定排除的文件
+func IsExcludeFile(filePath string, excludeNames *[]string) bool {
+	if excludeNames == nil || len(*excludeNames) == 0 {
+		return false
+	}
+
+	for _, pattern := range *excludeNames {
+		fileName := path.Base(strings.ReplaceAll(filePath, "\\", "/"))
+		m, _ := regexp.MatchString(pattern, fileName)
+		if m {
+			return true
+		}
+	}
+	return false
+}
+
+// ResizeUploadBlockSize 自动调整分片大小，方便支持极大单文件上传。返回新的分片大小
+func ResizeUploadBlockSize(fileSize, defaultBlockSize int64) int64 {
+	if (aliyunpan.MaxPartNum * defaultBlockSize) > fileSize {
+		return defaultBlockSize
+	}
+	sizeOfMB := int64(math.Ceil(float64(fileSize) / float64(aliyunpan.MaxPartNum) / 1024.0))
+	return sizeOfMB * 1024
 }

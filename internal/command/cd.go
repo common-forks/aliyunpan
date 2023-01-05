@@ -15,6 +15,7 @@ package command
 
 import (
 	"fmt"
+	"github.com/tickstep/aliyunpan-api/aliyunpan"
 	"github.com/tickstep/aliyunpan/cmder"
 	"github.com/tickstep/aliyunpan/internal/config"
 	"github.com/urfave/cli"
@@ -33,14 +34,17 @@ func CmdCd() cli.Command {
 	切换 /我的资源 工作目录:
 	aliyunpan cd /我的资源
 
+	切换 /我的资源 工作目录，使用通配符:
+	aliyunpan cd /我的*
+
 	切换上级目录:
 	aliyunpan cd ..
 
 	切换根目录:
 	aliyunpan cd /
 `,
-		Before: cmder.ReloadConfigFunc,
-		After:  cmder.SaveConfigFunc,
+		Before: ReloadConfigFunc,
+		After:  SaveConfigFunc,
 		Action: func(c *cli.Context) error {
 			if c.NArg() == 0 {
 				cli.ShowCommandHelp(c, c.Command.Name)
@@ -69,7 +73,7 @@ func CmdPwd() cli.Command {
 		Usage:     "输出工作目录",
 		UsageText: cmder.App().Name + " pwd",
 		Category:  "阿里云盘",
-		Before:    cmder.ReloadConfigFunc,
+		Before:    ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if config.Config.ActiveUser() == nil {
 				fmt.Println("未登录账号")
@@ -90,24 +94,41 @@ func RunChangeDirectory(driveId, targetPath string) {
 	user := config.Config.ActiveUser()
 	targetPath = user.PathJoin(driveId, targetPath)
 
-	targetPathInfo, err := user.PanClient().FileInfoByPath(driveId, targetPath)
+	//targetPathInfo, err := user.PanClient().FileInfoByPath(driveId, targetPath)
+	files, err := matchPathByShellPattern(driveId, targetPath)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 
+	var targetPathInfo *aliyunpan.FileEntity
+	if len(files) == 1 {
+		targetPathInfo = files[0]
+	} else {
+		for _, f := range files {
+			if f.IsFolder() {
+				targetPathInfo = f
+				break
+			}
+		}
+	}
+	if targetPathInfo == nil {
+		fmt.Println("路径不存在")
+		return
+	}
+
 	if !targetPathInfo.IsFolder() {
-		fmt.Printf("错误: %s 不是一个目录 (文件夹)\n", targetPath)
+		fmt.Printf("错误: %s 不是一个目录 (文件夹)\n", targetPathInfo.Path)
 		return
 	}
 
 	if user.IsFileDriveActive() {
-		user.Workdir = targetPath
+		user.Workdir = targetPathInfo.Path
 		user.WorkdirFileEntity = *targetPathInfo
 	} else if user.IsAlbumDriveActive() {
-		user.AlbumWorkdir = targetPath
+		user.AlbumWorkdir = targetPathInfo.Path
 		user.AlbumWorkdirFileEntity = *targetPathInfo
 	}
 
-	fmt.Printf("改变工作目录: %s\n", targetPath)
+	fmt.Printf("改变工作目录: %s\n", targetPathInfo.Path)
 }

@@ -22,8 +22,11 @@ import (
 	"github.com/tickstep/aliyunpan/internal/config"
 	"github.com/tickstep/aliyunpan/internal/file/downloader"
 	"github.com/tickstep/aliyunpan/internal/functions"
+	"github.com/tickstep/aliyunpan/internal/localfile"
+	"github.com/tickstep/aliyunpan/internal/log"
 	"github.com/tickstep/aliyunpan/internal/plugins"
 	"github.com/tickstep/aliyunpan/internal/taskframework"
+	"github.com/tickstep/aliyunpan/internal/utils"
 	"github.com/tickstep/aliyunpan/library/requester/transfer"
 	"github.com/tickstep/library-go/converter"
 	"github.com/tickstep/library-go/logger"
@@ -65,6 +68,9 @@ type (
 		DriveId            string
 
 		fileInfo *aliyunpan.FileEntity // 文件或目录详情
+
+		// 下载文件记录器
+		FileRecorder *log.FileRecorder
 	}
 )
 
@@ -95,32 +101,64 @@ func (dtu *DownloadTaskUnit) verboseInfof(format string, a ...interface{}) {
 	}
 }
 
-// download 执行下载
+// download 执行下载文件（非目录）
 func (dtu *DownloadTaskUnit) download() (err error) {
 	var (
 		writer downloader.Writer
 		file   *os.File
 	)
 
-	dtu.Cfg.InstanceStatePath = dtu.SavePath + DownloadSuffix
-
 	// 创建下载的目录
 	// 获取SavePath所在的目录
 	dir := filepath.Dir(dtu.SavePath)
-	fileInfo, err := os.Stat(dir)
-	if err != nil {
-		// 目录不存在, 创建
-		err = os.MkdirAll(dir, 0777)
+	//fileInfo, err := os.Stat(dir)
+	//if err != nil {
+	//	// 目录不存在, 创建
+	//	err = os.MkdirAll(dir, 0777)
+	//	if err != nil {
+	//		return err
+	//	}
+	//} else if !fileInfo.IsDir() {
+	//	// SavePath所在的目录不是目录
+	//	return fmt.Errorf("%s, path %s: not a directory", StrDownloadInitError, dir)
+	//}
+	// 支持本地符号链接文件，整体逻辑和上面注释代码一致
+	savePathSymlinkFile := localfile.SymlinkFile{
+		LogicPath: dtu.SavePath,
+		RealPath:  "",
+	}
+	originSaveRootSymlinkFile := localfile.NewSymlinkFile(dtu.OriginSaveRootPath)
+	suffixPath := localfile.GetSuffixPath(dir, dtu.OriginSaveRootPath)
+	saveDirPathSymlinkFile, saveDirPathFileInfo, err := localfile.RetrieveRealPathFromLogicSuffixPath(originSaveRootSymlinkFile, suffixPath)
+	if err != nil && !os.IsExist(err) {
+		// 本地保存目录不存在，需要创建对应的保存目录
+		realSaveDirPath := saveDirPathSymlinkFile.RealPath
+		suffixPath = localfile.GetSuffixPath(filepath.Dir(dtu.SavePath), saveDirPathSymlinkFile.LogicPath) // 获取后缀不存在的路径
+		if suffixPath != "" {
+			realSaveDirPath = filepath.Join(realSaveDirPath, suffixPath) // 拼接
+		}
+		// 创建保存目录
+		err = os.MkdirAll(realSaveDirPath, 0777)
 		if err != nil {
 			return err
 		}
-	} else if !fileInfo.IsDir() {
+
+		// 拼接完整的保存文件路径
+		savePathSymlinkFile.RealPath = filepath.Join(realSaveDirPath, filepath.Base(localfile.CleanPath(dtu.SavePath)))
+	} else if !saveDirPathFileInfo.IsDir() {
 		// SavePath所在的目录不是目录
-		return fmt.Errorf("%s, path %s: not a directory", StrDownloadInitError, dir)
+		return fmt.Errorf("%s, path %s: not a directory", StrDownloadInitError, saveDirPathSymlinkFile.RealPath)
+	} else {
+		// 保存目录已存在，直接拼接成文件完整保存路径
+		savePathSymlinkFile.RealPath = filepath.Join(saveDirPathSymlinkFile.RealPath, filepath.Base(localfile.CleanPath(dtu.SavePath)))
 	}
+	savePathSymlinkFile, _, _ = localfile.RetrieveRealPath(savePathSymlinkFile)
+
+	// 下载配置文件存储路径
+	dtu.Cfg.InstanceStatePath = savePathSymlinkFile.RealPath + DownloadSuffix
 
 	// 打开文件
-	writer, file, err = downloader.NewDownloaderWriterByFilename(dtu.SavePath, os.O_CREATE|os.O_WRONLY, 0666)
+	writer, file, err = downloader.NewDownloaderWriterByFilename(savePathSymlinkFile.RealPath, os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		return fmt.Errorf("%s, %s", StrDownloadInitError, err)
 	}
@@ -251,11 +289,13 @@ func (dtu *DownloadTaskUnit) panHTTPClient() (client *requester.HTTPClient) {
 	return client
 }
 
+// handleError 下载错误处理器
 func (dtu *DownloadTaskUnit) handleError(result *taskframework.TaskUnitRunResult) {
 	switch value := result.Err.(type) {
 	case *apierror.ApiError:
 		switch value.ErrCode() {
 		case apierror.ApiCodeFileNotFoundCode:
+		case apierror.ApiCodeForbiddenFileInTheRecycleBin:
 			result.NeedRetry = false
 			break
 		default:
@@ -332,6 +372,18 @@ func (dtu *DownloadTaskUnit) OnRetry(lastRunResult *taskframework.TaskUnitRunRes
 func (dtu *DownloadTaskUnit) OnSuccess(lastRunResult *taskframework.TaskUnitRunResult) {
 	// 执行插件
 	dtu.pluginCallback("success")
+
+	// 下载文件数据记录
+	if config.Config.FileRecordConfig == "1" {
+		if dtu.fileInfo.IsFile() {
+			dtu.FileRecorder.Append(&log.FileRecordItem{
+				Status:   "成功",
+				TimeStr:  utils.NowTimeStr(),
+				FileSize: dtu.fileInfo.FileSize,
+				FilePath: dtu.fileInfo.Path,
+			})
+		}
+	}
 }
 
 func (dtu *DownloadTaskUnit) OnFailed(lastRunResult *taskframework.TaskUnitRunResult) {
@@ -348,6 +400,9 @@ func (dtu *DownloadTaskUnit) OnFailed(lastRunResult *taskframework.TaskUnitRunRe
 }
 
 func (dtu *DownloadTaskUnit) pluginCallback(result string) {
+	if dtu.fileInfo == nil {
+		return
+	}
 	pluginManger := plugins.NewPluginManager(config.GetPluginDir())
 	plugin, _ := pluginManger.GetPlugin()
 	pluginParam := &plugins.DownloadFileFinishParams{
@@ -402,18 +457,72 @@ func (dtu *DownloadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 	fmt.Print("\n")
 	fmt.Printf("[%s] ----\n%s\n", dtu.taskInfo.Id(), dtu.fileInfo.String())
 
+	// 调用插件
+	ft := "file"
+	if dtu.fileInfo.IsFolder() {
+		ft = "folder"
+	}
+	pluginManger := plugins.NewPluginManager(config.GetPluginDir())
+	plugin, _ := pluginManger.GetPlugin()
+	localFilePath := strings.TrimPrefix(dtu.SavePath, dtu.OriginSaveRootPath)
+	localFilePath = strings.TrimPrefix(strings.TrimPrefix(localFilePath, "\\"), "/")
+	pluginParam := &plugins.DownloadFilePrepareParams{
+		DriveId:            dtu.fileInfo.DriveId,
+		DriveFilePath:      dtu.fileInfo.Path,
+		DriveFileName:      dtu.fileInfo.FileName,
+		DriveFileSize:      dtu.fileInfo.FileSize,
+		DriveFileType:      ft,
+		DriveFileSha1:      dtu.fileInfo.ContentHash,
+		DriveFileUpdatedAt: dtu.fileInfo.UpdatedAt,
+		LocalFilePath:      localFilePath,
+	}
+	if downloadFilePrepareResult, er := plugin.DownloadFilePrepareCallback(plugins.GetContext(config.Config.ActiveUser()), pluginParam); er == nil && downloadFilePrepareResult != nil {
+		if strings.Compare("yes", downloadFilePrepareResult.DownloadApproved) != 0 {
+			// skip download this file
+			fmt.Printf("插件取消了该文件下载: %s\n", dtu.fileInfo.Path)
+			result.Succeed = false
+			result.Cancel = true
+			return
+		}
+		if downloadFilePrepareResult.LocalFilePath != "" {
+			targetSaveRelativePath := strings.TrimPrefix(downloadFilePrepareResult.LocalFilePath, "/")
+			targetSaveRelativePath = strings.TrimPrefix(targetSaveRelativePath, "\\")
+			dtu.SavePath = path.Clean(dtu.OriginSaveRootPath + string(os.PathSeparator) + targetSaveRelativePath)
+			fmt.Printf("插件修改文件下载保存路径为: %s\n", dtu.SavePath)
+		}
+	}
+
 	// 如果是一个目录, 将子文件和子目录加入队列
 	if dtu.fileInfo.IsFolder() {
-		_, err := os.Stat(dtu.SavePath)
+		//_, err := os.Stat(dtu.SavePath)
+		//if err != nil && !os.IsExist(err) {
+		//	os.MkdirAll(dtu.SavePath, 0777) // 首先在本地创建目录, 保证空目录也能被保存
+		//}
+		// 支持本地符号逻辑文件，整体逻辑等效上面的注释代码
+		originSaveRootSymlinkFile := localfile.NewSymlinkFile(dtu.OriginSaveRootPath)
+		suffixPath := localfile.GetSuffixPath(dtu.SavePath, dtu.OriginSaveRootPath)
+		savePathSymlinkFile, _, err := localfile.RetrieveRealPathFromLogicSuffixPath(originSaveRootSymlinkFile, suffixPath)
 		if err != nil && !os.IsExist(err) {
-			os.MkdirAll(dtu.SavePath, 0777) // 首先在本地创建目录, 保证空目录也能被保存
+			realSavePath := savePathSymlinkFile.RealPath
+			suffixPath = localfile.GetSuffixPath(dtu.SavePath, savePathSymlinkFile.LogicPath) // 获取后缀不存在的路径
+			if suffixPath != "" {
+				realSavePath = filepath.Join(realSavePath, suffixPath)
+			}
+			err1 := os.MkdirAll(realSavePath, 0777) // 首先在本地创建目录, 保证空目录也能被保存
+			if err1 != nil {
+				result.ResultMessage = "创建目录错误"
+				result.Succeed = false
+				result.Err = err1
+				result.NeedRetry = false
+				return
+			}
 		}
 
 		// 获取该目录下的文件列表
 		fileList, apierr := dtu.PanClient.FileListGetAll(&aliyunpan.FileListParam{
 			DriveId:      dtu.DriveId,
 			ParentFileId: dtu.fileInfo.FileId,
-		})
+		}, 1000)
 		if apierr != nil {
 			// retry one more time
 			time.Sleep(3 * time.Second)
@@ -421,7 +530,7 @@ func (dtu *DownloadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 			fileList, apierr = dtu.PanClient.FileListGetAll(&aliyunpan.FileListParam{
 				DriveId:      dtu.DriveId,
 				ParentFileId: dtu.fileInfo.FileId,
-			})
+			}, 1000)
 			if apierr != nil {
 				logger.Verbosef("[%s] get download file list for %s error: %s\n",
 					dtu.taskInfo.Id(), dtu.FilePanPath, apierr)
@@ -445,6 +554,13 @@ func (dtu *DownloadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 		// 创建对应的任务进行下载
 		for k := range fileList {
 			fileList[k].Path = path.Join(dtu.FilePanPath, fileList[k].FileName)
+
+			// 是否排除下载
+			if utils.IsExcludeFile(fileList[k].Path, &dtu.Cfg.ExcludeNames) {
+				fmt.Printf("排除文件: %s\n", fileList[k].Path)
+				continue
+			}
+
 			if fileList[k].IsFolder() {
 				logger.Verbosef("[%s] create sub folder download task: %s\n",
 					dtu.taskInfo.Id(), fileList[k].Path)
@@ -468,40 +584,15 @@ func (dtu *DownloadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 		return
 	}
 
-	// 调用插件
-	pluginManger := plugins.NewPluginManager(config.GetPluginDir())
-	plugin, _ := pluginManger.GetPlugin()
-	localFilePath := strings.TrimPrefix(dtu.SavePath, dtu.OriginSaveRootPath)
-	localFilePath = strings.TrimPrefix(strings.TrimPrefix(localFilePath, "\\"), "/")
-	pluginParam := &plugins.DownloadFilePrepareParams{
-		DriveId:            dtu.fileInfo.DriveId,
-		DriveFilePath:      dtu.fileInfo.Path,
-		DriveFileName:      dtu.fileInfo.FileName,
-		DriveFileSize:      dtu.fileInfo.FileSize,
-		DriveFileType:      "file",
-		DriveFileSha1:      dtu.fileInfo.ContentHash,
-		DriveFileUpdatedAt: dtu.fileInfo.UpdatedAt,
-		LocalFilePath:      localFilePath,
-	}
-	if downloadFilePrepareResult, er := plugin.DownloadFilePrepareCallback(plugins.GetContext(config.Config.ActiveUser()), pluginParam); er == nil && downloadFilePrepareResult != nil {
-		if strings.Compare("yes", downloadFilePrepareResult.DownloadApproved) != 0 {
-			// skip download this file
-			fmt.Printf("插件取消了该文件下载: %s\n", dtu.fileInfo.Path)
-			result.Succeed = false
-			result.Cancel = true
-			return
-		}
-		if downloadFilePrepareResult.LocalFilePath != "" {
-			targetSaveRelativePath := strings.TrimPrefix(downloadFilePrepareResult.LocalFilePath, "/")
-			targetSaveRelativePath = strings.TrimPrefix(targetSaveRelativePath, "\\")
-			dtu.SavePath = path.Clean(dtu.OriginSaveRootPath + string(os.PathSeparator) + targetSaveRelativePath)
-			fmt.Printf("插件修改文件下载保存路径为: %s\n", dtu.SavePath)
-		}
-	}
-
 	fmt.Printf("[%s] 准备下载: %s\n", dtu.taskInfo.Id(), dtu.FilePanPath)
 
-	if !dtu.IsOverwrite && FileExist(dtu.SavePath) {
+	//if !dtu.IsOverwrite && FileExist(dtu.SavePath) {
+	//	fmt.Printf("[%s] 文件已经存在: %s, 跳过...\n", dtu.taskInfo.Id(), dtu.SavePath)
+	//	result.Succeed = true // 执行成功
+	//	return
+	//}
+	// 支持符号文件，逻辑和注释代码一致
+	if !dtu.IsOverwrite && SymlinkFileExist(dtu.SavePath, dtu.OriginSaveRootPath) {
 		fmt.Printf("[%s] 文件已经存在: %s, 跳过...\n", dtu.taskInfo.Id(), dtu.SavePath)
 		result.Succeed = true // 执行成功
 		return

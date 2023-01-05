@@ -28,6 +28,7 @@ import (
 	"github.com/tickstep/library-go/requester/rio/speeds"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -286,6 +287,12 @@ func (der *Downloader) checkLoadBalancers() *LoadBalancerResponseList {
 func (der *Downloader) Execute() error {
 	der.lazyInit()
 
+	// zero file, no need to download data
+	if der.fileInfo.FileSize == 0 {
+		cmdutil.Trigger(der.onFinishEvent)
+		return nil
+	}
+
 	var (
 		loadBalancerResponseList = der.checkLoadBalancers()
 		bii                      *transfer.DownloadInstanceInfo
@@ -382,7 +389,7 @@ func (der *Downloader) Execute() error {
 		cmdutil.Trigger(der.onCancelEvent)
 		return apierr
 	}
-	if durl == nil || durl.Url == "" || durl.Url == aliyunpan.IllegalDownloadUrl {
+	if durl == nil || durl.Url == "" || strings.HasPrefix(durl.Url, aliyunpan.IllegalDownloadUrlPrefix) {
 		logger.Verbosef("无法获取有效的下载链接: %+v\n", durl)
 		cmdutil.Trigger(der.onCancelEvent)
 		der.removeInstanceState() // 移除断点续传文件
@@ -397,7 +404,7 @@ func (der *Downloader) Execute() error {
 			continue
 		}
 
-		logger.Verbosef("work id: %d, download url: %s\n", k, durl)
+		logger.Verbosef("work id: %d, download url: %v\n", k, durl)
 		client := requester.NewHTTPClient()
 		client.SetKeepAlive(true)
 		client.SetTimeout(10 * time.Minute)

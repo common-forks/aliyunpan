@@ -97,7 +97,7 @@ func newRapidUploadItem(rapidUploadShareLink string) (*RapidUploadItem, error) {
 	item.FileSha1 = strings.TrimSpace(parts[1])
 
 	// size
-	if size,e := strconv.ParseInt(parts[2], 10, 64); e == nil{
+	if size, e := strconv.ParseInt(parts[2], 10, 64); e == nil {
 		item.FileSize = size
 	} else {
 		return nil, fmt.Errorf("文件大小错误: %s", rapidUploadShareLink)
@@ -131,7 +131,6 @@ func (r *RapidUploadItem) createRapidUploadLink(hideRelativePath bool) string {
 	p := r.FilePath
 	p = strings.ReplaceAll(p, "\\", "/")
 
-
 	fileName := path.Base(p)
 	dirPath := path.Dir(p)
 
@@ -160,10 +159,10 @@ func CmdConfig() cli.Command {
 		Usage:       "显示和修改程序配置项",
 		Description: "显示和修改程序配置项",
 		Category:    "配置",
-		Before:      cmder.ReloadConfigFunc,
-		After:       cmder.SaveConfigFunc,
+		Before:      ReloadConfigFunc,
+		After:       SaveConfigFunc,
 		Action: func(c *cli.Context) error {
-			fmt.Printf("----\n运行 %s config set 可进行设置配置\n\n当前配置:\n", cmder.App().Name)
+			fmt.Printf("----\n当前配置目录: %s\n运行 %s config set 可进行设置配置\n\n当前配置:\n", config.GetConfigDir(), cmder.App().Name)
 			config.Config.PrintTable()
 			return nil
 		},
@@ -227,6 +226,9 @@ func CmdConfig() cli.Command {
 					if c.IsSet("local_addrs") {
 						config.Config.SetLocalAddrs(c.String("local_addrs"))
 					}
+					if c.IsSet("file_record_config") {
+						config.Config.SetFileRecorderConfig(c.String("file_record_config"))
+					}
 
 					err := config.Config.Save()
 					if err != nil {
@@ -277,12 +279,15 @@ func CmdConfig() cli.Command {
 						Name:  "local_addrs",
 						Usage: "设置本地网卡地址, 多个地址用逗号隔开",
 					},
+					cli.StringFlag{
+						Name:  "file_record_config",
+						Usage: "设置是否开启上传、下载、同步文件的结果记录功能",
+					},
 				},
 			},
 		},
 	}
 }
-
 
 func CmdTool() cli.Command {
 	return cli.Command{

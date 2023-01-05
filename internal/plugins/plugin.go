@@ -89,6 +89,61 @@ type (
 		LocalFilePath      string `json:"localFilePath"`
 	}
 
+	// SyncScanLocalFilePrepareParams 同步备份-扫描本地文件前参数
+	SyncScanLocalFilePrepareParams struct {
+		LocalFilePath      string `json:"localFilePath"`
+		LocalFileName      string `json:"localFileName"`
+		LocalFileSize      int64  `json:"localFileSize"`
+		LocalFileType      string `json:"localFileType"`
+		LocalFileUpdatedAt string `json:"localFileUpdatedAt"`
+		DriveId            string `json:"driveId"`
+	}
+
+	// SyncScanLocalFilePrepareResult 同步备份-扫描本地文件-返回结果
+	SyncScanLocalFilePrepareResult struct {
+		// SyncScanLocalApproved 该文件是否确认扫描，yes-允许扫描，no-禁止扫描
+		SyncScanLocalApproved string `json:"syncScanLocalApproved"`
+	}
+
+	// SyncScanPanFilePrepareParams 同步备份-扫描云盘文件前参数
+	SyncScanPanFilePrepareParams struct {
+		DriveId            string `json:"driveId"`
+		DriveFileName      string `json:"driveFileName"`
+		DriveFilePath      string `json:"driveFilePath"`
+		DriveFileSha1      string `json:"driveFileSha1"`
+		DriveFileSize      int64  `json:"driveFileSize"`
+		DriveFileType      string `json:"driveFileType"`
+		DriveFileUpdatedAt string `json:"driveFileUpdatedAt"`
+	}
+
+	// SyncScanPanFilePrepareResult 同步备份-扫描云盘文件-返回结果
+	SyncScanPanFilePrepareResult struct {
+		// SyncScanPanApproved 该文件是否确认扫描，yes-允许扫描，no-禁止扫描
+		SyncScanPanApproved string `json:"syncScanPanApproved"`
+	}
+
+	// SyncFileFinishParams 同步备份-文件同步结束-回调参数
+	SyncFileFinishParams struct {
+		Action        string `json:"action"`
+		ActionResult  string `json:"actionResult"`
+		DriveId       string `json:"driveId"`
+		FileName      string `json:"fileName"`
+		FilePath      string `json:"filePath"`
+		FileSha1      string `json:"fileSha1"`
+		FileSize      int64  `json:"fileSize"`
+		FileType      string `json:"fileType"`
+		FileUpdatedAt string `json:"fileUpdatedAt"`
+	}
+
+	// UserTokenRefreshFinishParams 用户Token刷新完成后回调函数
+	UserTokenRefreshFinishParams struct {
+		Result    string `json:"result"`
+		Message   string `json:"message"`
+		OldToken  string `json:"oldToken"`
+		NewToken  string `json:"newToken"`
+		UpdatedAt string `json:"updatedAt"`
+	}
+
 	// Plugin 插件接口
 	Plugin interface {
 		// Start 启动
@@ -105,6 +160,18 @@ type (
 
 		// DownloadFileFinishCallback 下载文件结束的回调函数
 		DownloadFileFinishCallback(context *Context, params *DownloadFileFinishParams) error
+
+		// SyncScanLocalFilePrepareCallback 同步备份-扫描本地文件的回调函数
+		SyncScanLocalFilePrepareCallback(context *Context, params *SyncScanLocalFilePrepareParams) (*SyncScanLocalFilePrepareResult, error)
+
+		// SyncScanPanFilePrepareCallback 同步备份-扫描本地文件的回调函数
+		SyncScanPanFilePrepareCallback(context *Context, params *SyncScanPanFilePrepareParams) (*SyncScanPanFilePrepareResult, error)
+
+		// SyncFileFinishCallback 同步备份-同步文件完成的回调函数
+		SyncFileFinishCallback(context *Context, params *SyncFileFinishParams) error
+
+		// UserTokenRefreshFinishCallback 用户Token刷新完成后回调函数
+		UserTokenRefreshFinishCallback(context *Context, params *UserTokenRefreshFinishParams) error
 
 		// Stop 停止
 		Stop() error

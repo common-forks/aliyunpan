@@ -1,5 +1,10 @@
+#!/bin/sh
+
 # 请更改成你自己电脑上aliyunpan执行文件所在的目录
 #cd /path/to/aliyunpan/folder
+
+# 配置环境变量
+#export ALIYUNPAN_CONFIG_DIR=/path/to/your/aliyunpan/config
 
 chmod +x ./aliyunpan
 

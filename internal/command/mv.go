@@ -16,10 +16,12 @@ package command
 import (
 	"fmt"
 	"github.com/tickstep/aliyunpan-api/aliyunpan"
-	"github.com/tickstep/aliyunpan/cmder"
+	"github.com/tickstep/aliyunpan/cmder/cmdtable"
 	"github.com/tickstep/aliyunpan/internal/config"
 	"github.com/urfave/cli"
+	"os"
 	"path"
+	"strconv"
 )
 
 func CmdMv() cli.Command {
@@ -29,15 +31,18 @@ func CmdMv() cli.Command {
 		UsageText: `移动:
 	aliyunpan mv <文件/目录1> <文件/目录2> <文件/目录3> ... <目标目录>`,
 		Description: `
-	注意: 移动多个文件和目录时, 请确保每一个文件和目录都存在, 否则移动操作会失败.
+	注意: 移动多个文件和目录时, 请确保每一个文件和目录都存在, 否则移动操作会失败。支持通配符匹配移动文件，通配符当前只能匹配文件名，不能匹配文件路径。
 
 	示例:
 
 	将 /我的资源/1.mp4 移动到 根目录 /
 	aliyunpan mv /我的资源/1.mp4 /
+
+	将 /我的资源 目录下所有的.png文件 移动到 /我的图片 目录下面，使用通配符匹配
+	aliyunpan mv /我的资源/*.png /我的图片
 `,
 		Category: "阿里云盘",
-		Before:   cmder.ReloadConfigFunc,
+		Before:   ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if c.NArg() <= 1 {
 				cli.ShowCommandHelp(c, c.Command.Name)
@@ -47,7 +52,6 @@ func CmdMv() cli.Command {
 				fmt.Println("未登录账号")
 				return nil
 			}
-
 			RunMove(parseDriveId(c), c.Args()...)
 			return nil
 		},
@@ -66,7 +70,7 @@ func RunMove(driveId string, paths ...string) {
 	activeUser := GetActiveUser()
 	cacheCleanPaths := []string{}
 	opFileList, targetFile, _, err := getFileInfo(driveId, paths...)
-	if err !=  nil {
+	if err != nil {
 		fmt.Println(err)
 		return
 	}
@@ -83,20 +87,20 @@ func RunMove(driveId string, paths ...string) {
 	failedMoveFiles := []*aliyunpan.FileEntity{}
 	moveFileParamList := []*aliyunpan.FileMoveParam{}
 	fileId2FileEntity := map[string]*aliyunpan.FileEntity{}
-	for _,mfi := range opFileList {
+	for _, mfi := range opFileList {
 		fileId2FileEntity[mfi.FileId] = mfi
 		moveFileParamList = append(moveFileParamList,
 			&aliyunpan.FileMoveParam{
-				DriveId: driveId,
-				FileId: mfi.FileId,
-				ToDriveId: driveId,
+				DriveId:        driveId,
+				FileId:         mfi.FileId,
+				ToDriveId:      driveId,
 				ToParentFileId: targetFile.FileId,
 			})
 		cacheCleanPaths = append(cacheCleanPaths, path.Dir(mfi.Path))
 	}
-	fmr,er := activeUser.PanClient().FileMove(moveFileParamList)
+	fmr, er := activeUser.PanClient().FileMove(moveFileParamList)
 
-	for _,rs := range fmr {
+	for _, rs := range fmr {
 		if !rs.Success {
 			failedMoveFiles = append(failedMoveFiles, fileId2FileEntity[rs.FileId])
 		}
@@ -104,13 +108,22 @@ func RunMove(driveId string, paths ...string) {
 
 	if len(failedMoveFiles) > 0 {
 		fmt.Println("以下文件移动失败：")
-		for _,f := range failedMoveFiles {
+		for _, f := range failedMoveFiles {
 			fmt.Println(f.FileName)
 		}
 		fmt.Println("")
 	}
 	if er == nil {
-		fmt.Println("操作成功, 已移动文件到目标目录: ", targetFile.Path)
+		pnt := func() {
+			tb := cmdtable.NewTable(os.Stdout)
+			tb.SetHeader([]string{"#", "文件/目录"})
+			for k, rs := range fmr {
+				tb.Append([]string{strconv.Itoa(k + 1), fileId2FileEntity[rs.FileId].Path})
+			}
+			tb.Render()
+		}
+		fmt.Println("操作成功, 以下文件已移动到目标目录: ", targetFile.Path)
+		pnt()
 		activeUser.DeleteCache(cacheCleanPaths)
 	} else {
 		fmt.Println("无法移动文件，请稍后重试")
@@ -130,6 +143,22 @@ func getFileInfo(driveId string, paths ...string) (opFileList []*aliyunpan.FileE
 		return nil, nil, nil, fmt.Errorf("指定目标文件夹不存在")
 	}
 
-	opFileList, failedPaths, error = GetAppFileInfoByPaths(driveId, paths[:len(paths)-1]...)
+	for idx := 0; idx < (len(paths) - 1); idx++ {
+		absolutePath = path.Clean(activeUser.PathJoin(driveId, paths[idx]))
+		fileList, err1 := matchPathByShellPattern(driveId, absolutePath)
+		if err1 != nil {
+			failedPaths = append(failedPaths, absolutePath)
+			continue
+		}
+		if fileList == nil || len(fileList) == 0 {
+			// 文件不存在
+			failedPaths = append(failedPaths, absolutePath)
+			continue
+		}
+		for _, f := range fileList {
+			// 移动匹配的文件
+			opFileList = append(opFileList, f)
+		}
+	}
 	return
 }

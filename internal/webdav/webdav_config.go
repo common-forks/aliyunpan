@@ -15,26 +15,27 @@ type WebdavUser struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Scope    string `json:"scope"`
+	Mode     string `json:"mode"`
 }
 
 type WebdavConfig struct {
 	// 指定Webdav使用哪个账号的云盘资源
-	PanUserId string `json:"panUserId"`
-	PanDriveId string `json:"panDriveId"`
-	PanUser     *config.PanUser `json:"-"`
-	UploadChunkSize int `json:"uploadChunkSize"` // 上传文件分片数据块大小，该数值不能太小，建议大于等于512KB
-	TransferUrlType  int `json:"transferUrlType"`   // 上传/下载URL类别，1-默认，2-阿里云ECS
+	PanUserId       string          `json:"panUserId"`
+	PanDriveId      string          `json:"panDriveId"`
+	PanUser         *config.PanUser `json:"-"`
+	UploadChunkSize int             `json:"uploadChunkSize"` // 上传文件分片数据块大小，该数值不能太小，建议大于等于512KB
+	TransferUrlType int             `json:"transferUrlType"` // 上传/下载URL类别，1-默认，2-阿里云ECS
 
-	Address string `json:"address"`
-	Port       int `json:"port"`
-	Prefix       string  `json:"prefix"`
-	Users []WebdavUser `json:"users"`
+	Address string       `json:"address"`
+	Port    int          `json:"port"`
+	Prefix  string       `json:"prefix"`
+	Users   []WebdavUser `json:"users"`
 }
 
 func (w *WebdavConfig) StartServer() {
 	users := map[string]*User{}
-	for _,u := range w.Users {
-		fileItem,e := w.PanUser.PanClient().FileInfoByPath(w.PanDriveId, u.Scope)
+	for _, u := range w.Users {
+		fileItem, e := w.PanUser.PanClient().FileInfoByPath(w.PanDriveId, u.Scope)
 		if e != nil {
 			logger.Verboseln("scope not existed, shutting server")
 			return
@@ -44,22 +45,22 @@ func (w *WebdavConfig) StartServer() {
 			wdfi.fullPath = "/" + wdfi.fullPath
 		}
 		panClientProxy := &PanClientProxy{
-			PanUser:    w.PanUser,
-			PanDriveId: w.PanDriveId,
+			PanUser:            w.PanUser,
+			PanDriveId:         w.PanDriveId,
 			PanTransferUrlType: w.TransferUrlType,
 		}
 		users[u.Username] = &User{
 			Username: u.Username,
 			Password: u.Password,
 			Scope:    u.Scope,
-			Modify:   true,
+			Modify:   u.Mode == "rw",
 			Rules:    nil,
-			Handler:  &webdav.Handler{
+			Handler: &webdav.Handler{
 				Prefix: w.Prefix,
 				FileSystem: WebDavDir{
-					Dir:     webdav.Dir(u.Scope),
-					NoSniff: false,
-					panClientProxy: panClientProxy,
+					Dir:             webdav.Dir(u.Scope),
+					NoSniff:         false,
+					panClientProxy:  panClientProxy,
 					fileInfo:        wdfi,
 					uploadChunkSize: w.UploadChunkSize,
 				},
@@ -70,9 +71,9 @@ func (w *WebdavConfig) StartServer() {
 		_, _ = panClientProxy.FileListGetAll(u.Scope)
 	}
 	cfg := &Config{
-		Auth:      true,
-		NoSniff:   false,
-		Cors:      CorsCfg{
+		Auth:    true,
+		NoSniff: false,
+		Cors: CorsCfg{
 			Enabled:     false,
 			Credentials: false,
 		},
@@ -80,7 +81,7 @@ func (w *WebdavConfig) StartServer() {
 		LogFormat: "",
 	}
 
-	listener, err := net.Listen("tcp", w.Address + ":" + strconv.Itoa(w.Port))
+	listener, err := net.Listen("tcp", w.Address+":"+strconv.Itoa(w.Port))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -88,4 +89,3 @@ func (w *WebdavConfig) StartServer() {
 		logger.Verboseln("shutting server", err)
 	}
 }
-

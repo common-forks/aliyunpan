@@ -18,6 +18,9 @@ import (
 	"github.com/tickstep/aliyunpan-api/aliyunpan"
 	"github.com/tickstep/aliyunpan/cmder"
 	"github.com/tickstep/aliyunpan/internal/config"
+	"github.com/tickstep/aliyunpan/internal/plugins"
+	"github.com/tickstep/aliyunpan/internal/utils"
+	"github.com/tickstep/library-go/logger"
 	"github.com/urfave/cli"
 )
 
@@ -27,7 +30,7 @@ func CmdToken() cli.Command {
 		Usage:     "Token相关操作",
 		UsageText: cmder.App().Name + " token",
 		Category:  "阿里云盘账号",
-		Before:    cmder.ReloadConfigFunc,
+		Before:    ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			cli.ShowCommandHelp(c, c.Command.Name)
 			return nil
@@ -73,27 +76,54 @@ func CmdToken() cli.Command {
 
 // RunTokenUpdate 执行Token更新
 func RunTokenUpdate(modeFlag string) {
-	cmder.ReloadConfigFunc(nil)
+	ReloadConfigFunc(nil)
+
+	// 获取当前插件
+	pluginManger := plugins.NewPluginManager(config.GetPluginDir())
+	plugin, _ := pluginManger.GetPlugin()
+	params := &plugins.UserTokenRefreshFinishParams{
+		Result:    "success",
+		Message:   "",
+		OldToken:  "",
+		NewToken:  "",
+		UpdatedAt: utils.NowTimeStr(),
+	}
+
 	userList := config.Config.UserList
 	if userList == nil || len(userList) == 0 {
 		fmt.Printf("没有登录用户，无需刷新Token\n")
 		return
 	}
-	for _,user := range userList {
+	for _, user := range userList {
+		params.Result = "success"
+
 		if modeFlag == "1" {
 			if user.UserId != config.Config.ActiveUID {
 				continue
 			}
 		}
-		newToken,e := aliyunpan.GetAccessTokenFromRefreshToken(user.RefreshToken)
+		newToken, e := aliyunpan.GetAccessTokenFromRefreshToken(user.RefreshToken)
 		if e != nil {
+			params.Result = "fail"
+			params.Message = e.Error()
 			fmt.Printf("无法为%s用户获取新的RefreshToken，可能需要重新登录\n", user.Nickname)
 			continue
 		}
 		if newToken != nil && newToken.RefreshToken != "" {
+			params.OldToken = user.RefreshToken
+			params.NewToken = newToken.RefreshToken
+
 			user.RefreshToken = newToken.RefreshToken
+			user.WebToken = *newToken
 			fmt.Printf("成功刷新%s用户的RefreshToken\n", user.Nickname)
+		} else {
+			params.Result = "fail"
+		}
+
+		// plugin callback
+		if er := plugin.UserTokenRefreshFinishCallback(plugins.GetContext(user), params); er != nil {
+			logger.Verbosef("UserTokenRefreshFinishCallback error: " + er.Error())
 		}
 	}
-	cmder.SaveConfigFunc(nil)
+	SaveConfigFunc(nil)
 }

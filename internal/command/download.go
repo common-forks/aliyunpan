@@ -20,6 +20,7 @@ import (
 	"github.com/tickstep/aliyunpan/internal/config"
 	"github.com/tickstep/aliyunpan/internal/file/downloader"
 	"github.com/tickstep/aliyunpan/internal/functions/pandownload"
+	"github.com/tickstep/aliyunpan/internal/log"
 	"github.com/tickstep/aliyunpan/internal/taskframework"
 	"github.com/tickstep/aliyunpan/internal/utils"
 	"github.com/tickstep/aliyunpan/library/requester/transfer"
@@ -28,8 +29,10 @@ import (
 	"github.com/tickstep/library-go/requester/rio/speeds"
 	"github.com/urfave/cli"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"time"
 )
 
@@ -45,8 +48,9 @@ type (
 		MaxRetry             int
 		NoCheck              bool
 		ShowProgress         bool
-		DriveId             string
-		UseInternalUrl bool // 是否使用内置链接
+		DriveId              string
+		UseInternalUrl       bool     // 是否使用内置链接
+		ExcludeNames         []string // 排除的文件名，包括文件夹和文件。即这些文件/文件夹不进行下载，支持正则表达式
 	}
 
 	// LocateDownloadOption 获取下载链接可选参数
@@ -70,8 +74,8 @@ func CmdDownload() cli.Command {
 		Usage:     "下载文件/目录",
 		UsageText: cmder.App().Name + " download <文件/目录路径1> <文件/目录2> <文件/目录3> ...",
 		Description: `
-	下载的文件默认保存到, 程序所在目录的 download/ 目录.
-	通过 aliyunpan config set -savedir <savedir>, 自定义保存的目录.
+	下载的文件默认保存到, 程序所在目录的 download/ 目录。支持软链接文件，包括Linux/macOS(ln命令)和Windows(mklink命令)创建的符号链接文件。
+	通过 aliyunpan config set -savedir <savedir>, 自定义保存的目录。
 	支持多个文件或目录下载.
 	自动跳过下载重名的文件!
 
@@ -84,16 +88,30 @@ func CmdDownload() cli.Command {
 	aliyunpan config set -savedir D:/Downloads
 
 	下载 /我的资源/1.mp4
-	aliyunpan d /我的资源/1.mp4
+	aliyunpan download /我的资源/1.mp4
+
+	下载 /我的资源 目录下面所有的mp4文件，使用通配符
+	aliyunpan download /我的资源/*.mp4
 
 	下载 /我的资源 整个目录!!
-	aliyunpan d /我的资源
+	aliyunpan download /我的资源
 
-    下载 /我的资源/1.mp4 并保存下载的文件到本地的 d:/panfile
-	aliyunpan d --saveto d:/panfile /我的资源/1.mp4
+	下载 /我的资源 整个目录，但是排除所有的jpg文件
+	aliyunpan download -exn "\.jpg$" /我的资源
+
+	下载 /我的资源/1.mp4 并保存下载的文件到本地的 d:/panfile
+	aliyunpan download --saveto d:/panfile /我的资源/1.mp4
+
+  参考：
+    以下是典型的排除特定文件或者文件夹的例子，注意：参数值必须是正则表达式。在正则表达式中，^表示匹配开头，$表示匹配结尾。
+    1)排除@eadir文件或者文件夹：-exn "^@eadir$"
+    2)排除.jpg文件：-exn "\.jpg$"
+    3)排除.号开头的文件：-exn "^\."
+    4)排除~号开头的文件：-exn "^~"
+    5)排除 myfile.txt 文件：-exn "^myfile.txt$"
 `,
 		Category: "阿里云盘",
-		Before:   cmder.ReloadConfigFunc,
+		Before:   ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if c.NArg() == 0 {
 				cli.ShowCommandHelp(c, c.Command.Name)
@@ -105,7 +123,9 @@ func CmdDownload() cli.Command {
 				saveTo string
 			)
 			if c.Bool("save") {
-				saveTo = "."
+				// 使用当前工作目录
+				pwd, _ := os.Getwd()
+				saveTo = path.Clean(pwd)
 			} else if c.String("saveto") != "" {
 				saveTo = filepath.Clean(c.String("saveto"))
 			}
@@ -120,10 +140,24 @@ func CmdDownload() cli.Command {
 				MaxRetry:             c.Int("retry"),
 				NoCheck:              c.Bool("nocheck"),
 				ShowProgress:         !c.Bool("np"),
-				DriveId:             parseDriveId(c),
+				DriveId:              parseDriveId(c),
+				ExcludeNames:         c.StringSlice("exn"),
 			}
 
+			// 获取下载文件锁，保证下载操作单实例
+			//locker := filelocker.NewFileLocker(config.GetLockerDir() + "/aliyunpan-download")
+			//if e := filelocker.LockFile(locker, 0755, true, 5*time.Second); e != nil {
+			//	logger.Verboseln(e)
+			//	fmt.Println("本应用其他实例正在执行下载，请先停止或者等待其完成")
+			//	return nil
+			//}
+
 			RunDownload(c.Args(), do)
+
+			// 释放文件锁
+			//if locker != nil {
+			//	filelocker.UnlockFile(locker)
+			//}
 			return nil
 		},
 		Flags: []cli.Flag{
@@ -169,6 +203,11 @@ func CmdDownload() cli.Command {
 				Usage: "网盘ID",
 				Value: "",
 			},
+			cli.StringSliceFlag{
+				Name:  "exn",
+				Usage: "exclude name，指定排除的文件夹或者文件的名称，被排除的文件不会进行下载，只支持正则表达式。支持同时排除多个名称，每一个名称就是一个exn参数",
+				Value: nil,
+			},
 		},
 	}
 }
@@ -183,15 +222,23 @@ func downloadPrintFormat(load int) string {
 // RunDownload 执行下载网盘内文件
 func RunDownload(paths []string, options *DownloadOptions) {
 	activeUser := GetActiveUser()
+	activeUser.PanClient().EnableCache()
+	activeUser.PanClient().ClearCache()
+	defer activeUser.PanClient().DisableCache()
 	// pan token expired checker
-	go func() {
-		for {
+	continueFlag := int32(0)
+	atomic.StoreInt32(&continueFlag, 0)
+	defer func() {
+		atomic.StoreInt32(&continueFlag, 1)
+	}()
+	go func(flag *int32) {
+		for atomic.LoadInt32(flag) == 0 {
 			time.Sleep(time.Duration(1) * time.Minute)
 			if RefreshTokenInNeed(activeUser) {
 				logger.Verboseln("update access token for download task")
 			}
 		}
-	}()
+	}(&continueFlag)
 
 	if options == nil {
 		options = &DownloadOptions{}
@@ -213,8 +260,9 @@ func RunDownload(paths []string, options *DownloadOptions) {
 		BlockSize:                  MaxDownloadRangeSize,
 		MaxRate:                    config.Config.MaxDownloadRate,
 		InstanceStateStorageFormat: downloader.InstanceStateStorageFormatJSON,
-		ShowProgress: options.ShowProgress,
-		UseInternalUrl: config.Config.TransferUrlType == 2,
+		ShowProgress:               options.ShowProgress,
+		UseInternalUrl:             config.Config.TransferUrlType == 2,
+		ExcludeNames:               options.ExcludeNames,
 	}
 	if cfg.CacheSize == 0 {
 		cfg.CacheSize = int(DownloadCacheSize)
@@ -231,7 +279,25 @@ func RunDownload(paths []string, options *DownloadOptions) {
 		options.Parallel = config.MaxFileDownloadParallelNum
 	}
 
-	paths, err := matchPathByShellPattern(options.DriveId, paths...)
+	// 保存文件的本地根文件夹
+	originSaveRootPath := ""
+	if options.SaveTo != "" {
+		originSaveRootPath = options.SaveTo
+	} else {
+		// 使用默认的保存路径
+		originSaveRootPath = GetActiveUser().GetSavePath("")
+	}
+	fi, err1 := os.Stat(originSaveRootPath)
+	if err1 != nil && !os.IsExist(err1) {
+		os.MkdirAll(originSaveRootPath, 0777) // 首先在本地创建目录
+	} else {
+		if !fi.IsDir() {
+			fmt.Println("本地保存路径不是文件夹，请删除或者创建对应的文件夹：", originSaveRootPath)
+			return
+		}
+	}
+
+	paths, err := makePathAbsolute(options.DriveId, paths...)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -256,36 +322,61 @@ func RunDownload(paths []string, options *DownloadOptions) {
 	// 全局速度统计
 	globalSpeedsStat := &speeds.Speeds{}
 
+	// 下载记录器
+	fileRecorder := log.NewFileRecorder(config.GetLogDir() + "/download_file_records.csv")
+
 	// 处理队列
 	for k := range paths {
-		newCfg := *cfg
-		unit := pandownload.DownloadTaskUnit{
-			Cfg:                  &newCfg, // 复制一份新的cfg
-			PanClient:            panClient,
-			VerbosePrinter:       panCommandVerbose,
-			PrintFormat:          downloadPrintFormat(options.Load),
-			ParentTaskExecutor:   &executor,
-			DownloadStatistic:    statistic,
-			IsPrintStatus:        options.IsPrintStatus,
-			IsExecutedPermission: options.IsExecutedPermission,
-			IsOverwrite:          options.IsOverwrite,
-			NoCheck:              options.NoCheck,
-			FilePanPath:          paths[k],
-			DriveId:              options.DriveId,
-			GlobalSpeedsStat:     globalSpeedsStat,
+		// 使用通配符匹配
+		fileList, err2 := matchPathByShellPattern(options.DriveId, paths[k])
+		if err2 != nil {
+			fmt.Printf("获取文件出错，请稍后重试: %s\n", paths[k])
+			continue
 		}
+		if fileList == nil || len(fileList) == 0 {
+			// 文件不存在
+			fmt.Printf("文件不存在: %s\n", paths[k])
+			continue
+		}
+		for _, f := range fileList {
+			newCfg := *cfg
 
-		// 设置储存的路径
-		if options.SaveTo != "" {
-			unit.OriginSaveRootPath = options.SaveTo
-			unit.SavePath = filepath.Join(options.SaveTo, filepath.Base(paths[k]))
-		} else {
-			// 使用默认的保存路径
-			unit.OriginSaveRootPath = GetActiveUser().GetSavePath("")
-			unit.SavePath = GetActiveUser().GetSavePath(paths[k])
+			// 是否排除下载
+			if utils.IsExcludeFile(f.Path, &newCfg.ExcludeNames) {
+				fmt.Printf("排除文件: %s\n", f.Path)
+				continue
+			}
+
+			// 匹配的文件
+			unit := pandownload.DownloadTaskUnit{
+				Cfg:                  &newCfg, // 复制一份新的cfg
+				PanClient:            panClient,
+				VerbosePrinter:       panCommandVerbose,
+				PrintFormat:          downloadPrintFormat(options.Load),
+				ParentTaskExecutor:   &executor,
+				DownloadStatistic:    statistic,
+				IsPrintStatus:        options.IsPrintStatus,
+				IsExecutedPermission: options.IsExecutedPermission,
+				IsOverwrite:          options.IsOverwrite,
+				NoCheck:              options.NoCheck,
+				FilePanPath:          f.Path,
+				DriveId:              options.DriveId,
+				GlobalSpeedsStat:     globalSpeedsStat,
+				FileRecorder:         fileRecorder,
+			}
+
+			// 设置储存的路径
+			if options.SaveTo != "" {
+				unit.OriginSaveRootPath = options.SaveTo
+				unit.SavePath = filepath.Join(options.SaveTo, f.Path)
+			} else {
+				// 使用默认的保存路径
+				unit.OriginSaveRootPath = GetActiveUser().GetSavePath("")
+				unit.SavePath = GetActiveUser().GetSavePath(f.Path)
+			}
+			info := executor.Append(&unit, options.MaxRetry)
+			fmt.Printf("[%s] 加入下载队列: %s\n", info.Id(), f.Path)
 		}
-		info := executor.Append(&unit, options.MaxRetry)
-		fmt.Printf("[%s] 加入下载队列: %s\n", info.Id(), paths[k])
 	}
 
 	// 开始计时

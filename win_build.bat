@@ -43,6 +43,14 @@ else (
 )
 
 copy README.md %output%\%1
+copy docs\manual.md %output%\%1
 
+mkdir %output%\%1\plugin
+xcopy /e assets\plugin %output%\%1\plugin
+
+mkdir %output%\%1\sync_drive
+xcopy /e assets\sync_drive %output%\%1\sync_drive
+
+xcopy /e assets\scripts %output%\%1
 endlocal
 

@@ -29,7 +29,7 @@ func CmdLoglist() cli.Command {
 		Usage:       "列出帐号列表",
 		Description: "列出所有已登录的阿里账号",
 		Category:    "阿里云盘账号",
-		Before:      cmder.ReloadConfigFunc,
+		Before:      ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			fmt.Println(config.Config.UserList.String())
 			return nil
@@ -50,8 +50,8 @@ func CmdSu() cli.Command {
 	aliyunpan su <uid or name>
 `,
 		Category: "阿里云盘账号",
-		Before:   cmder.ReloadConfigFunc,
-		After:    cmder.SaveConfigFunc,
+		Before:   ReloadConfigFunc,
+		After:    SaveConfigFunc,
 		Action: func(c *cli.Context) error {
 			if c.NArg() >= 2 {
 				cli.ShowCommandHelp(c, c.Command.Name)
@@ -85,8 +85,8 @@ func CmdSu() cli.Command {
 					return nil
 				}
 
-				if n, err := strconv.Atoi(index); err == nil && n >= 0 && n < numLogins {
-					uid = config.Config.UserList[n].UserId
+				if n, err1 := strconv.Atoi(index); err1 == nil && (n-1) >= 0 && (n-1) < numLogins {
+					uid = config.Config.UserList[n-1].UserId
 				} else {
 					fmt.Printf("切换用户失败, 请检查 # 值是否正确\n")
 					return nil
@@ -102,7 +102,7 @@ func CmdSu() cli.Command {
 			}
 
 			if switchedUser == nil {
-				switchedUser = cmder.TryLogin()
+				switchedUser = TryLogin()
 			}
 
 			if switchedUser != nil {
@@ -122,7 +122,7 @@ func CmdWho() cli.Command {
 		Usage:       "获取当前帐号",
 		Description: "获取当前帐号的信息",
 		Category:    "阿里云盘账号",
-		Before:      cmder.ReloadConfigFunc,
+		Before:      ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if config.Config.ActiveUser() == nil {
 				fmt.Println("未登录账号")

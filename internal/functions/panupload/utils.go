@@ -18,7 +18,9 @@ import (
 	"github.com/tickstep/library-go/converter"
 	"github.com/tickstep/library-go/logger"
 	"net/url"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -45,18 +47,34 @@ func getBlockSize(fileSize int64) int64 {
 	return MinUploadBlockSize
 }
 
-
-// isUrlExpired 上传链接是否已过期。过期返回True
-func isUrlExpired(urlStr string) bool {
+// IsUrlExpired 上传链接是否已过期。过期返回True
+func IsUrlExpired(urlStr string) bool {
 	u, err := url.Parse(urlStr)
 	if err != nil {
 		return true
 	}
 	expiredTimeSecStr := u.Query().Get("x-oss-expires")
-	expiredTimeSec,_ := strconv.ParseInt(expiredTimeSecStr, 10, 64)
-	if (time.Now().Unix() - 10) >= expiredTimeSec {
+	expiredTimeSec, _ := strconv.ParseInt(expiredTimeSecStr, 10, 64)
+	if (expiredTimeSec - time.Now().Unix()) <= 300 { // 小于5分钟
 		// expired
 		return true
+	}
+	return false
+}
+
+func IsVideoFile(fileName string) bool {
+	if fileName == "" {
+		return false
+	}
+	extName := strings.ToLower(path.Ext(fileName))
+	if strings.Index(extName, ".") == 0 {
+		extName = strings.TrimPrefix(extName, ".")
+	}
+	extList := config.Config.GetVideoExtensionList()
+	for _, ext := range extList {
+		if ext == extName {
+			return true
+		}
 	}
 	return false
 }

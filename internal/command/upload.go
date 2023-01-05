@@ -17,16 +17,16 @@ import (
 	"fmt"
 	"github.com/tickstep/aliyunpan-api/aliyunpan/apierror"
 	"github.com/tickstep/aliyunpan/cmder"
+	"github.com/tickstep/aliyunpan/internal/log"
 	"github.com/tickstep/aliyunpan/internal/plugins"
 	"github.com/tickstep/aliyunpan/internal/utils"
 	"github.com/tickstep/library-go/requester/rio/speeds"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tickstep/library-go/logger"
@@ -58,6 +58,7 @@ type (
 		AllParallel    int // 所有文件并发上传数量，即可以同时并发上传多少个文件
 		Parallel       int // 单个文件并发上传数量
 		MaxRetry       int
+		MaxTimeoutSec  int // http请求超时时间，单位秒
 		NoRapidUpload  bool
 		ShowProgress   bool
 		IsOverwrite    bool // 覆盖已存在的文件，如果同名文件已存在则移到回收站里
@@ -78,6 +79,10 @@ var UploadFlags = []cli.Flag{
 		Name:  "retry",
 		Usage: "上传失败最大重试次数",
 		Value: DefaultUploadMaxRetry,
+	},
+	cli.IntFlag{
+		Name:  "timeout",
+		Usage: "上传请求超时时间，单位为秒。当遇到网络不好导致上传超时可以尝试调大该值，建议设置30秒以上",
 	},
 	cli.BoolFlag{
 		Name:  "np",
@@ -103,7 +108,7 @@ var UploadFlags = []cli.Flag{
 	},
 	cli.IntFlag{
 		Name:  "bs",
-		Usage: "block size，上传分片大小，单位KB。推荐值：1024 ~ 10240",
+		Usage: "block size，上传分片大小，单位KB。推荐值：1024 ~ 10240。当上传极大单文件时候请适当调高该值",
 		Value: 10240,
 	},
 }
@@ -115,7 +120,7 @@ func CmdUpload() cli.Command {
 		Usage:     "上传文件/目录",
 		UsageText: cmder.App().Name + " upload <本地文件/目录的路径1> <文件/目录2> <文件/目录3> ... <目标目录>",
 		Description: `
-	上传指定的文件夹或者文件，上传的文件将会保存到 <目标目录>.
+	上传指定的文件夹或者文件，上传的文件将会保存到 <目标目录>。支持软链接文件，包括Linux/macOS(ln命令)和Windows(mklink命令)创建的符号链接文件。
 
   示例:
     1. 将本地的 C:\Users\Administrator\Desktop\1.mp4 上传到网盘 /视频 目录
@@ -128,19 +133,22 @@ func CmdUpload() cli.Command {
     3. 将本地的 C:\Users\Administrator\Desktop 整个目录上传到网盘 /视频 目录
     aliyunpan upload C:/Users/Administrator/Desktop /视频
 
-    4. 使用相对路径
+    4. 将本地 200GB 极大文件 C:\Users\Administrator\Desktop\1.mp4 上传到网盘 /视频 目录，需要调高上传分片大小
+    aliyunpan upload -bs 30720 C:/Users/Administrator/Desktop/1.mp4 /视频
+
+    5. 使用相对路径
     aliyunpan upload 1.mp4 /视频
 
-    5. 覆盖上传，已存在的同名文件会被移到回收站
+    6. 覆盖上传，已存在的同名文件会被移到回收站
     aliyunpan upload -ow 1.mp4 /视频
 
-    6. 将本地的 C:\Users\Administrator\Video 整个目录上传到网盘 /视频 目录，但是排除所有的.jpg文件
+    7. 将本地的 C:\Users\Administrator\Video 整个目录上传到网盘 /视频 目录，但是排除所有的.jpg文件
     aliyunpan upload -exn "\.jpg$" C:/Users/Administrator/Video /视频
 
-    7. 将本地的 C:\Users\Administrator\Video 整个目录上传到网盘 /视频 目录，但是排除所有的.jpg文件和.mp3文件，每一个排除项就是一个exn参数
+    8. 将本地的 C:\Users\Administrator\Video 整个目录上传到网盘 /视频 目录，但是排除所有的.jpg文件和.mp3文件，每一个排除项就是一个exn参数
     aliyunpan upload -exn "\.jpg$" -exn "\.mp3$" C:/Users/Administrator/Video /视频
 
-    8. 将本地的 C:\Users\Administrator\Video 整个目录上传到网盘 /视频 目录，但是排除所有的 @eadir 文件夹
+    9. 将本地的 C:\Users\Administrator\Video 整个目录上传到网盘 /视频 目录，但是排除所有的 @eadir 文件夹
     aliyunpan upload -exn "^@eadir$" C:/Users/Administrator/Video /视频
 
   参考：
@@ -152,7 +160,7 @@ func CmdUpload() cli.Command {
     5)排除 myfile.txt 文件：-exn "^myfile.txt$"
 `,
 		Category: "阿里云盘",
-		Before:   cmder.ReloadConfigFunc,
+		Before:   ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if c.NArg() < 2 {
 				cli.ShowCommandHelp(c, c.Command.Name)
@@ -160,10 +168,28 @@ func CmdUpload() cli.Command {
 			}
 
 			subArgs := c.Args()
+
+			timeout := 0
+			if c.IsSet("timeout") {
+				timeout = c.Int("timeout")
+				if timeout < 0 {
+					timeout = 0
+				}
+			}
+
+			// 获取上传文件锁，保证上传操作单实例
+			//locker := filelocker.NewFileLocker(config.GetLockerDir() + "/aliyunpan-upload")
+			//if e := filelocker.LockFile(locker, 0755, true, 5*time.Second); e != nil {
+			//	logger.Verboseln(e)
+			//	fmt.Println("本应用其他实例正在执行上传，请先停止或者等待其完成")
+			//	return nil
+			//}
+
 			RunUpload(subArgs[:c.NArg()-1], subArgs[c.NArg()-1], &UploadOptions{
 				AllParallel:   c.Int("p"), // 多文件上传的时候，允许同时并行上传的文件数量
 				Parallel:      1,          // 一个文件同时多少个线程并发上传的数量。阿里云盘只支持单线程按顺序进行文件part数据上传，所以只能是1
 				MaxRetry:      c.Int("retry"),
+				MaxTimeoutSec: timeout,
 				NoRapidUpload: c.Bool("norapid"),
 				ShowProgress:  !c.Bool("np"),
 				IsOverwrite:   c.Bool("ow"),
@@ -171,6 +197,11 @@ func CmdUpload() cli.Command {
 				ExcludeNames:  c.StringSlice("exn"),
 				BlockSize:     int64(c.Int("bs") * 1024),
 			})
+
+			// 释放文件锁
+			//if locker != nil {
+			//	filelocker.UnlockFile(locker)
+			//}
 			return nil
 		},
 		Flags: UploadFlags,
@@ -201,7 +232,7 @@ func CmdRapidUpload() cli.Command {
 	aliyunpan rapidupload "aliyunpan://file.dmg|752FCCBFB2436A6FFCA3B287831D4FAA5654B07E|7005440|pan_folder" "aliyunpan://file1.dmg|752FCCBFB2436A6FFCA3B287831D4FAA5654B07E|7005440|pan_folder"
 `,
 		Category: "阿里云盘",
-		Before:   cmder.ReloadConfigFunc,
+		Before:   ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if c.NArg() <= 0 {
 				cli.ShowCommandHelp(c, c.Command.Name)
@@ -233,15 +264,23 @@ func CmdRapidUpload() cli.Command {
 // RunUpload 执行文件上传
 func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 	activeUser := GetActiveUser()
+	activeUser.PanClient().EnableCache()
+	activeUser.PanClient().ClearCache()
+	defer activeUser.PanClient().DisableCache()
 	// pan token expired checker
-	go func() {
-		for {
+	continueFlag := int32(0)
+	atomic.StoreInt32(&continueFlag, 0)
+	defer func() {
+		atomic.StoreInt32(&continueFlag, 1)
+	}()
+	go func(flag *int32) {
+		for atomic.LoadInt32(flag) == 0 {
 			time.Sleep(time.Duration(1) * time.Minute)
 			if RefreshTokenInNeed(activeUser) {
 				logger.Verboseln("update access token for upload task")
 			}
 		}
-	}()
+	}(&continueFlag)
 
 	if opt == nil {
 		opt = &UploadOptions{}
@@ -265,6 +304,11 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 		opt.MaxRetry = DefaultUploadMaxRetry
 	}
 	opt.UseInternalUrl = config.Config.TransferUrlType == 2
+
+	// 超时时间
+	if opt.MaxTimeoutSec > 0 {
+		activeUser.PanClient().SetTimeout(time.Duration(opt.MaxTimeoutSec) * time.Second)
+	}
 
 	fmt.Printf("\n[0] 当前文件上传最大并发量为: %d, 上传分片大小为: %s\n", opt.AllParallel, converter.ConvertFileSize(opt.BlockSize, 2))
 
@@ -309,15 +353,17 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 	// 获取当前插件
 	plugin, _ := pluginManger.GetPlugin()
 
+	// 上传记录器
+	fileRecorder := log.NewFileRecorder(config.GetLogDir() + "/upload_file_records.csv")
+
 	// 遍历指定的文件并创建上传任务
 	for _, curPath := range localPaths {
-		var walkFunc filepath.WalkFunc
-		var db panupload.SyncDb
+		var walkFunc localfile.MyWalkFunc
 		curPath = filepath.Clean(curPath)
 		localPathDir := filepath.Dir(curPath)
 
 		// 是否排除上传
-		if isExcludeFile(curPath, opt) {
+		if utils.IsExcludeFile(curPath, &opt.ExcludeNames) {
 			fmt.Printf("排除文件: %s\n", curPath)
 			continue
 		}
@@ -327,137 +373,106 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 			localPathDir = ""
 		}
 
-		if fi, err := os.Stat(curPath); err == nil && fi.IsDir() {
-			//使用绝对路径避免异常
-			dbpath, err := filepath.Abs(curPath)
+		walkFunc = func(file localfile.SymlinkFile, fi os.FileInfo, err error) error {
 			if err != nil {
-				dbpath = curPath
-			}
-			dbpath += string(os.PathSeparator) + BackupMetaDirName
-			if di, err := os.Stat(dbpath); err == nil && di.IsDir() {
-				db, err = panupload.OpenSyncDb(dbpath+string(os.PathSeparator)+"db", BackupMetaBucketName)
-				if db != nil {
-					defer func(syncDb panupload.SyncDb) {
-						db.Close()
-					}(db)
-				} else {
-					fmt.Println(curPath, "同步数据库打开失败,跳过该目录的备份", err)
-					continue
-				}
-			}
-		}
-
-		walkFunc = func(file string, fi os.FileInfo, err error) error {
-			if err != nil {
-				return err
+				// skip this error file and continue recurse
+				logger.Verboseln("upload process file: ", file, " error: ", err)
+				return nil
 			}
 			if os.PathSeparator == '\\' {
-				file = cmdutil.ConvertToWindowsPathSeparator(file)
+				file.LogicPath = cmdutil.ConvertToWindowsPathSeparator(file.LogicPath)
+				file.RealPath = cmdutil.ConvertToWindowsPathSeparator(file.RealPath)
 			}
 
 			// 是否排除上传
-			if isExcludeFile(file, opt) {
-				fmt.Printf("排除文件: %s\n", file)
+			if utils.IsExcludeFile(file.LogicPath, &opt.ExcludeNames) {
+				fmt.Printf("排除文件: %s\n", file.LogicPath)
 				return filepath.SkipDir
 			}
 
-			if fi.Mode()&os.ModeSymlink != 0 { // 读取 symbol link
-				err = WalkAllFile(file+string(os.PathSeparator), walkFunc)
-				return err
-			}
-
-			subSavePath := strings.TrimPrefix(file, localPathDir)
+			subSavePath := strings.TrimPrefix(file.LogicPath, localPathDir)
 
 			// 针对 windows 的目录处理
 			if os.PathSeparator == '\\' {
 				subSavePath = cmdutil.ConvertToUnixPathSeparator(subSavePath)
 			}
-
 			subSavePath = path.Clean(savePath + aliyunpan.PathSeparator + subSavePath)
-			var ufm *panupload.UploadedFileMeta
-
-			if db != nil {
-				if ufm = db.Get(subSavePath); ufm.Size == fi.Size() && ufm.ModTime == fi.ModTime().Unix() {
-					logger.Verbosef("文件未修改跳过:%s\n", file)
-					return nil
-				}
-			}
-
-			if fi.IsDir() { // 备份目录处理
-				if strings.HasPrefix(fi.Name(), BackupMetaDirName) {
-					return filepath.SkipDir
-				}
-				//不存在同步数据库时跳过
-				if db == nil || ufm.FileId != "" {
-					return nil
-				}
-				panClient := activeUser.PanClient()
-				fmt.Println(subSavePath, "云盘文件夹预创建")
-				//首先尝试直接创建文件夹
-				if ufm = db.Get(path.Dir(subSavePath)); ufm.IsFolder == true && ufm.FileId != "" {
-					rs, err := panClient.Mkdir(opt.DriveId, ufm.FileId, fi.Name())
-					if err == nil && rs != nil && rs.FileId != "" {
-						db.Put(subSavePath, &panupload.UploadedFileMeta{FileId: rs.FileId, IsFolder: true, ModTime: fi.ModTime().Unix(), ParentId: rs.ParentFileId})
-						return nil
-					}
-				}
-				rs, err := panClient.MkdirRecursive(opt.DriveId, "", "", 0, strings.Split(path.Clean(subSavePath), "/"))
-				if err == nil && rs != nil && rs.FileId != "" {
-					db.Put(subSavePath, &panupload.UploadedFileMeta{FileId: rs.FileId, IsFolder: true, ModTime: fi.ModTime().Unix(), ParentId: rs.ParentFileId})
-					return nil
-				}
-				fmt.Println(subSavePath, "创建云盘文件夹失败", err)
-				return filepath.SkipDir
-			}
 
 			// 插件回调
-			if !fi.IsDir() { // 针对文件上传前进行回调
-				pluginParam := &plugins.UploadFilePrepareParams{
-					LocalFilePath:      file,
-					LocalFileName:      fi.Name(),
-					LocalFileSize:      fi.Size(),
-					LocalFileType:      "file",
-					LocalFileUpdatedAt: fi.ModTime().Format("2006-01-02 15:04:05"),
-					DriveId:            activeUser.ActiveDriveId,
-					DriveFilePath:      strings.TrimPrefix(strings.TrimPrefix(subSavePath, savePath), "/"),
+			ft := "file"
+			if fi.IsDir() {
+				ft = "folder"
+			}
+			pluginParam := &plugins.UploadFilePrepareParams{
+				LocalFilePath:      file.LogicPath,
+				LocalFileName:      fi.Name(),
+				LocalFileSize:      fi.Size(),
+				LocalFileType:      ft,
+				LocalFileUpdatedAt: fi.ModTime().Format("2006-01-02 15:04:05"),
+				DriveId:            activeUser.ActiveDriveId,
+				DriveFilePath:      strings.TrimPrefix(strings.TrimPrefix(subSavePath, savePath), "/"),
+			}
+			if uploadFilePrepareResult, er := plugin.UploadFilePrepareCallback(plugins.GetContext(activeUser), pluginParam); er == nil && uploadFilePrepareResult != nil {
+				if strings.Compare("yes", uploadFilePrepareResult.UploadApproved) != 0 {
+					// skip upload this file
+					fmt.Printf("插件禁止该文件上传: %s\n", file.LogicPath)
+					return filepath.SkipDir
 				}
-				if uploadFilePrepareResult, er := plugin.UploadFilePrepareCallback(plugins.GetContext(activeUser), pluginParam); er == nil && uploadFilePrepareResult != nil {
-					if strings.Compare("yes", uploadFilePrepareResult.UploadApproved) != 0 {
-						// skip upload this file
-						fmt.Printf("插件禁止该文件上传: %s\n", file)
-						return filepath.SkipDir
-					}
-					if uploadFilePrepareResult.DriveFilePath != "" {
-						targetSavePanRelativePath := strings.TrimPrefix(uploadFilePrepareResult.DriveFilePath, "/")
-						subSavePath = path.Clean(savePath + aliyunpan.PathSeparator + targetSavePanRelativePath)
-						fmt.Printf("插件修改文件网盘保存路径为: %s\n", subSavePath)
-					}
+				if uploadFilePrepareResult.DriveFilePath != "" {
+					targetSavePanRelativePath := strings.TrimPrefix(uploadFilePrepareResult.DriveFilePath, "/")
+					subSavePath = path.Clean(savePath + aliyunpan.PathSeparator + targetSavePanRelativePath)
+					fmt.Printf("插件修改文件网盘保存路径为: %s\n", subSavePath)
 				}
 			}
 
-			taskinfo := executor.Append(&panupload.UploadTaskUnit{
-				LocalFileChecksum: localfile.NewLocalFileEntity(file),
-				SavePath:          subSavePath,
-				DriveId:           opt.DriveId,
-				PanClient:         activeUser.PanClient(),
-				UploadingDatabase: uploadDatabase,
-				FolderCreateMutex: folderCreateMutex,
-				Parallel:          opt.Parallel,
-				NoRapidUpload:     opt.NoRapidUpload,
-				BlockSize:         opt.BlockSize,
-				UploadStatistic:   statistic,
-				ShowProgress:      opt.ShowProgress,
-				IsOverwrite:       opt.IsOverwrite,
-				FolderSyncDb:      db,
-				UseInternalUrl:    opt.UseInternalUrl,
-				GlobalSpeedsStat:  globalSpeedsStat,
-			}, opt.MaxRetry)
-
-			fmt.Printf("[%s] 加入上传队列: %s\n", taskinfo.Id(), file)
+			// 创建对应的文件上传任务
+			// 上传里面的文件会创建对应的缺失文件夹
+			if !fi.IsDir() {
+				taskinfo := executor.Append(&panupload.UploadTaskUnit{
+					LocalFileChecksum: localfile.NewLocalSymlinkFileEntity(file),
+					SavePath:          subSavePath,
+					DriveId:           opt.DriveId,
+					PanClient:         activeUser.PanClient(),
+					UploadingDatabase: uploadDatabase,
+					FolderCreateMutex: folderCreateMutex,
+					Parallel:          opt.Parallel,
+					NoRapidUpload:     opt.NoRapidUpload,
+					BlockSize:         opt.BlockSize,
+					UploadStatistic:   statistic,
+					ShowProgress:      opt.ShowProgress,
+					IsOverwrite:       opt.IsOverwrite,
+					UseInternalUrl:    opt.UseInternalUrl,
+					GlobalSpeedsStat:  globalSpeedsStat,
+					FileRecorder:      fileRecorder,
+				}, opt.MaxRetry)
+				fmt.Printf("[%s] 加入上传队列: %s\n", taskinfo.Id(), file.LogicPath)
+			} else {
+				// 创建文件夹
+				// 这样空文件夹也可以正确上传
+				saveFilePath := subSavePath
+				if saveFilePath != "/" {
+					folderCreateMutex.Lock()
+					fmt.Printf("正在检测和创建云盘文件夹: %s\n", saveFilePath)
+					_, apierr1 := activeUser.PanClient().FileInfoByPath(opt.DriveId, saveFilePath)
+					time.Sleep(1 * time.Second)
+					if apierr1 != nil && apierr1.Code == apierror.ApiCodeFileNotFoundCode {
+						logger.Verbosef("%s 创建云盘文件夹: %s\n", utils.NowTimeStr(), saveFilePath)
+						rs, apierr := activeUser.PanClient().Mkdir(opt.DriveId, "root", saveFilePath)
+						if apierr != nil || rs.FileId == "" {
+							fmt.Printf("创建云盘文件夹失败: %s\n", saveFilePath)
+						}
+					}
+					folderCreateMutex.Unlock()
+				}
+			}
 			return nil
 		}
-		if err := WalkAllFile(curPath, walkFunc); err != nil {
-			fmt.Printf("警告: 遍历错误: %s\n", err)
+
+		file := localfile.NewSymlinkFile(curPath)
+		if err = localfile.WalkAllFile(file, walkFunc); err != nil {
+			if err != filepath.SkipDir {
+				fmt.Printf("警告: 遍历错误: %s\n", err)
+			}
 		}
 	}
 
@@ -479,67 +494,12 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 			tb := cmdtable.NewTable(os.Stdout)
 			for e := failed.Shift(); e != nil; e = failed.Shift() {
 				item := e.(*taskframework.TaskInfoItem)
-				tb.Append([]string{item.Info.Id(), item.Unit.(*panupload.UploadTaskUnit).LocalFileChecksum.Path})
+				tb.Append([]string{item.Info.Id(), item.Unit.(*panupload.UploadTaskUnit).LocalFileChecksum.Path.LogicPath})
 			}
 			tb.Render()
 		}
 	}
 	activeUser.DeleteCache(GetAllPathFolderByPath(savePath))
-}
-
-// 是否是排除上传的文件
-func isExcludeFile(filePath string, opt *UploadOptions) bool {
-	if opt == nil || len(opt.ExcludeNames) == 0 {
-		return false
-	}
-
-	for _, pattern := range opt.ExcludeNames {
-		fileName := path.Base(filePath)
-
-		m, _ := regexp.MatchString(pattern, fileName)
-		if m {
-			return true
-		}
-	}
-	return false
-}
-
-func WalkAllFile(dirPath string, walkFn filepath.WalkFunc) error {
-	info, err := os.Lstat(dirPath)
-	if err != nil {
-		err = walkFn(dirPath, nil, err)
-	} else {
-		err = walkAllFile(dirPath, info, walkFn)
-	}
-	return err
-}
-
-func walkAllFile(dirPath string, info os.FileInfo, walkFn filepath.WalkFunc) error {
-	if !info.IsDir() {
-		return walkFn(dirPath, info, nil)
-	}
-
-	files, err := ioutil.ReadDir(dirPath)
-	if err != nil {
-		return walkFn(dirPath, nil, err)
-	}
-	for _, fi := range files {
-		subFilePath := dirPath + "/" + fi.Name()
-		err := walkFn(subFilePath, fi, err)
-		if err != nil && err != filepath.SkipDir {
-			return err
-		}
-		if fi.IsDir() {
-			if err == filepath.SkipDir {
-				continue
-			}
-			err := walkAllFile(subFilePath, fi, walkFn)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // RunRapidUpload 秒传

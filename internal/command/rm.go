@@ -32,7 +32,7 @@ func CmdRm() cli.Command {
 		UsageText: cmder.App().Name + " rm <文件/目录的路径1> <文件/目录2> <文件/目录3> ...",
 		Description: `
 	注意: 删除多个文件和目录时, 请确保每一个文件和目录都存在, 否则删除操作会失败.
-	被删除的文件或目录可在网盘文件回收站找回.
+	被删除的文件或目录可在网盘文件回收站找回。支持通配符匹配删除文件，通配符当前只能匹配文件名，不能匹配文件路径。
 
 	示例:
 
@@ -44,9 +44,12 @@ func CmdRm() cli.Command {
 
 	删除 /我的资源 整个目录 !!
 	aliyunpan rm /我的资源
+
+	删除 /我的资源 目录下面的所有.zip文件，使用通配符匹配
+	aliyunpan rm /我的资源/*.zip
 `,
 		Category: "阿里云盘",
-		Before:   cmder.ReloadConfigFunc,
+		Before:   ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if c.NArg() == 0 {
 				cli.ShowCommandHelp(c, c.Command.Name)
@@ -80,25 +83,32 @@ func RunRemove(driveId string, paths ...string) {
 
 	for _, p := range paths {
 		absolutePath := path.Clean(activeUser.PathJoin(driveId, p))
-		fe, err := activeUser.PanClient().FileInfoByPath(driveId, absolutePath)
-		if err != nil {
+		fileList, err1 := matchPathByShellPattern(driveId, absolutePath)
+		if err1 != nil {
 			failedRmPaths = append(failedRmPaths, absolutePath)
 			continue
 		}
-		fe.Path = absolutePath
-		delFileInfos = append(delFileInfos, &aliyunpan.FileBatchActionParam{
-			DriveId:driveId,
-			FileId:fe.FileId,
-		})
-		fileId2FileEntity[fe.FileId] = fe
-		cacheCleanDirs = append(cacheCleanDirs, path.Dir(fe.Path))
+		if fileList == nil || len(fileList) == 0 {
+			// 失败，文件不存在
+			failedRmPaths = append(failedRmPaths, absolutePath)
+			continue
+		}
+		for _, f := range fileList {
+			// 删除匹配的文件
+			delFileInfos = append(delFileInfos, &aliyunpan.FileBatchActionParam{
+				DriveId: driveId,
+				FileId:  f.FileId,
+			})
+			fileId2FileEntity[f.FileId] = f
+			cacheCleanDirs = append(cacheCleanDirs, path.Dir(f.Path))
+		}
 	}
 
 	// delete
 	successDelFileEntity := []*aliyunpan.FileEntity{}
 	fdr, err := activeUser.PanClient().FileDelete(delFileInfos)
 	if fdr != nil {
-		for _,item := range fdr {
+		for _, item := range fdr {
 			if !item.Success {
 				failedRmPaths = append(failedRmPaths, fileId2FileEntity[item.FileId].Path)
 			} else {
@@ -111,7 +121,7 @@ func RunRemove(driveId string, paths ...string) {
 		tb := cmdtable.NewTable(os.Stdout)
 		tb.SetHeader([]string{"#", "文件/目录"})
 		for k := range successDelFileEntity {
-			tb.Append([]string{strconv.Itoa(k), successDelFileEntity[k].Path})
+			tb.Append([]string{strconv.Itoa(k + 1), successDelFileEntity[k].Path})
 		}
 		tb.Render()
 	}

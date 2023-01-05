@@ -30,7 +30,7 @@
 // {
 // 	"driveId": "19519221",
 // 	"driveFileName": "token.bat",
-// 	"driveFilePath": "aliyunpan/Downloads/token.bat",
+// 	"driveFilePath": "/aliyunpan/Downloads/token.bat",
 // 	"driveFileSha1": "08FBE28A5B8791A2F50225E2EC5CEEC3C7955A11",
 // 	"driveFileSize": 125330,
 // 	"driveFileType": "file",
@@ -101,7 +101,7 @@ function downloadFilePrepareCallback(context, params) {
 // {
 // 	"driveId": "19519221",
 // 	"driveFileName": "token.bat",
-// 	"driveFilePath": "aliyunpan/Downloads/token.bat",
+// 	"driveFilePath": "/aliyunpan/Downloads/token.bat",
 // 	"driveFileSha1": "08FBE28A5B8791A2F50225E2EC5CEEC3C7955A11",
 // 	"driveFileSize": 125330,
 // 	"driveFileType": "file",

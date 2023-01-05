@@ -2,7 +2,7 @@ version: '3'
 
 services:
   webdav:
-    image: tickstep/aliyunpan-webdav:tag
+    image: tickstep/aliyunpan-webdav:v0.1.6
     container_name: aliyunpan-webdav
     restart: always
     ports:
@@ -10,11 +10,13 @@ services:
     environment:
       - TZ=Asia/Shanghai
       # refresh token
-      - ALIYUNPAN_REFRESH_TOKEN=b9123...13e66a1
+      - ALIYUNPAN_REFRESH_TOKEN=4dd40e8b165...42b8833e4a507b6
       # webdav 登录用户名
       - ALIYUNPAN_AUTH_USER=admin
       # webdav 登录密码
       - ALIYUNPAN_AUTH_PASSWORD=admin
+      # webdav 网盘模式，支持：rw-读写，ro-只读
+      - ALIYUNPAN_WEBDAV_MODE=rw
       # 指定网盘类型为文件，可选： File-文件 Album-相册
       - ALIYUNPAN_PAN_DRIVE=File
       # 指定网盘文件夹作为webdav服务根目录

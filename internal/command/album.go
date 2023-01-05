@@ -46,7 +46,7 @@ func CmdAlbum() cli.Command {
 		Usage:     "相簿(Beta)",
 		UsageText: cmder.App().Name + " album",
 		Category:  "阿里云盘",
-		Before:    cmder.ReloadConfigFunc,
+		Before:    ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			cli.ShowCommandHelp(c, c.Command.Name)
 			return nil
@@ -240,7 +240,7 @@ func RunAlbumList() {
 	tb.SetHeader([]string{"#", "ALBUM_ID", "名称", "文件数量", "创建日期", "修改日期"})
 	tb.SetColumnAlignment([]int{tablewriter.ALIGN_DEFAULT, tablewriter.ALIGN_DEFAULT, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_CENTER, tablewriter.ALIGN_DEFAULT, tablewriter.ALIGN_DEFAULT})
 	for k, record := range records {
-		tb.Append([]string{strconv.Itoa(k), record.AlbumId, record.Name, strconv.Itoa(record.FileCount),
+		tb.Append([]string{strconv.Itoa(k + 1), record.AlbumId, record.Name, strconv.Itoa(record.FileCount),
 			record.CreatedAtStr(), record.UpdatedAtStr()})
 	}
 	tb.Render()
@@ -429,7 +429,7 @@ func RunAlbumAddFile(albumName string, filePathList []string, filterOption Album
 		return
 	}
 
-	paths, err := matchPathByShellPattern(activeUser.ActiveDriveId, filePathList...)
+	paths, err := makePathAbsolute(activeUser.ActiveDriveId, filePathList...)
 	if err != nil {
 		fmt.Println(err)
 		return

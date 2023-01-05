@@ -50,7 +50,7 @@ const (
 
 var (
 	// Version 版本号
-	Version = "v0.1.5"
+	Version = "v0.2.5"
 
 	// 命令历史文件
 	historyFilePath = filepath.Join(config.GetConfigDir(), "aliyunpan_command_history.txt")
@@ -75,16 +75,16 @@ func init() {
 }
 
 func checkLoginExpiredAndRelogin() {
-	cmder.ReloadConfigFunc(nil)
+	command.ReloadConfigFunc(nil)
 	activeUser := config.Config.ActiveUser()
 	if activeUser == nil || activeUser.UserId == "" {
 		// maybe expired, try to login
-		cmder.TryLogin()
+		command.TryLogin()
 	} else {
-		// refresh expired token
+		// 刷新过期Token并保存到配置文件
 		command.RefreshTokenInNeed(activeUser)
 	}
-	cmder.SaveConfigFunc(nil)
+	command.SaveConfigFunc(nil)
 }
 
 func main() {
@@ -96,7 +96,8 @@ func main() {
 	// check token expired task
 	go func() {
 		for {
-			time.Sleep(time.Duration(5) * time.Minute)
+			// Token刷新进程，不管是CLI命令行模式，还是直接命令模式，本刷新任务都会执行
+			time.Sleep(time.Duration(1) * time.Minute)
 			//time.Sleep(time.Duration(5) * time.Second)
 			checkLoginExpiredAndRelogin()
 		}
@@ -108,11 +109,15 @@ func main() {
 	app.Name = "aliyunpan"
 	app.Version = Version
 	app.Author = "tickstep/aliyunpan: https://github.com/tickstep/aliyunpan"
-	app.Copyright = "(c) 2021-2022 tickstep."
+	app.Copyright = "(c) 2021-2023 tickstep."
 	app.Usage = "阿里云盘客户端 for " + runtime.GOOS + "/" + runtime.GOARCH
-	app.Description = `aliyunpan 使用Go语言编写的阿里云盘命令行客户端, 为操作阿里云盘, 提供实用功能。
-   同时支持webdav文件协议，可以让阿里云盘变身为webdav协议的文件服务器，用于挂载作为Windows、Linux、Mac系统的磁盘进行使用。
-	具体功能, 参见 COMMANDS 列表
+	app.Description = `aliyunpan 是一款阿里云盘命令行客户端工具, 为操作阿里云盘, 提供实用功能。
+	支持webdav文件协议，可以让阿里云盘变身为webdav协议的文件服务器，用于挂载作为Windows、Linux、Mac系统的磁盘进行使用。
+	支持同步备份功能，支持备份本地文件到云盘，备份云盘文件到本地，双向同步备份。
+	具体功能, 参见 COMMANDS 列表。
+
+	支持设置环境变量 ALIYUNPAN_CONFIG_DIR 更改配置文件存储路径：
+	export ALIYUNPAN_CONFIG_DIR=/etc/aliyunpan/config
 
 	------------------------------------------------------------------------------
 	前往 https://github.com/tickstep/aliyunpan 以获取更多帮助信息!
@@ -142,6 +147,7 @@ func main() {
 
 		os.Setenv(config.EnvVerbose, c.String("verbose"))
 		isCli = true
+		config.IsAppInCliMode = true
 		logger.Verbosef("提示: 你已经开启VERBOSE调试日志\n\n")
 
 		var (
@@ -168,7 +174,7 @@ func main() {
 				acceptCompleteFileCommands = []string{
 					"cd", "cp", "xcp", "download", "ls", "mkdir", "mv", "pwd", "rename", "rm", "share", "upload", "login", "loglist", "logout",
 					"clear", "quit", "exit", "quota", "who", "sign", "update", "who", "su", "config",
-					"drive", "export", "import", "backup",
+					"drive", "export", "import", "sync", "tree",
 				}
 				closed = strings.LastIndex(line, " ") == len(line)-1
 			)
@@ -213,6 +219,10 @@ func main() {
 				}
 				targetPath string
 			)
+
+			if activeUser == nil {
+				return
+			}
 
 			if !closed {
 				targetPath = lineArgs[numArgs-1]
@@ -295,7 +305,7 @@ func main() {
 		fmt.Printf("提示: 输入 help 获取帮助.\n")
 
 		// check update
-		cmder.ReloadConfigFunc(c)
+		command.ReloadConfigFunc(c)
 		if config.Config.UpdateCheckInfo.LatestVer != "" {
 			if utils.ParseVersionNum(config.Config.UpdateCheckInfo.LatestVer) > utils.ParseVersionNum(config.AppVersion) {
 				fmt.Printf("\n当前的软件版本为：%s， 现在有新版本 %s 可供更新，强烈推荐进行更新！（可以输入 update 命令进行更新）\n\n",
@@ -316,7 +326,7 @@ func main() {
 				config.Config.UpdateCheckInfo.CheckTime = nowTime
 
 				// save
-				cmder.SaveConfigFunc(c)
+				command.SaveConfigFunc(c)
 			}
 		}()
 
@@ -327,7 +337,7 @@ func main() {
 			)
 
 			if activeUser == nil {
-				activeUser = cmder.TryLogin()
+				activeUser = command.TryLogin()
 			}
 
 			if activeUser != nil && activeUser.Nickname != "" {
@@ -411,6 +421,9 @@ func main() {
 		// 列出目录 ls
 		command.CmdLs(),
 
+		// 显示树形目录 tree
+		command.CmdTree(),
+
 		// 创建目录 mkdir
 		command.CmdMkdir(),
 
@@ -419,9 +432,6 @@ func main() {
 
 		//// 拷贝文件/目录 cp
 		//command.CmdCp(),
-		//
-		//// 拷贝文件/目录到个人云/家庭云 xcp
-		//command.CmdXcp(),
 
 		// 移动文件/目录 mv
 		command.CmdMv(),
@@ -432,8 +442,8 @@ func main() {
 		// 分享文件/目录 share
 		command.CmdShare(),
 
-		// 备份 backup
-		command.CmdBackup(),
+		// 同步备份 sync
+		command.CmdSync(),
 
 		// 上传文件/目录 upload
 		command.CmdUpload(),
@@ -443,6 +453,9 @@ func main() {
 
 		// 下载文件/目录 download
 		command.CmdDownload(),
+
+		// 获取文件下载链接
+		command.CmdLocateUrl(),
 
 		// 导出文件/目录元数据 export
 		//command.CmdExport(),
@@ -499,7 +512,7 @@ func main() {
 						if line == "" {
 							continue
 						}
-						tb.Append([]string{strconv.Itoa(idx), line})
+						tb.Append([]string{strconv.Itoa(idx + 1), line})
 						idx++
 					}
 					tb.Render()
@@ -588,32 +601,32 @@ func main() {
 		},
 
 		// 调试用 debug
-		{
-			Name:        "debug",
-			Aliases:     []string{"dg"},
-			Usage:       "开发调试用",
-			Description: "",
-			Category:    "debug",
-			Before:      cmder.ReloadConfigFunc,
-			Action: func(c *cli.Context) error {
-				os.Setenv(config.EnvVerbose, "1")
-				logger.IsVerbose = true
-				fmt.Println("显示调试日志", logger.IsVerbose)
-				return nil
-			},
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  "param",
-					Usage: "参数",
-				},
-				cli.BoolFlag{
-					Name:        "verbose",
-					Destination: &logger.IsVerbose,
-					EnvVar:      config.EnvVerbose,
-					Usage:       "显示调试信息",
-				},
-			},
-		},
+		//{
+		//	Name:        "debug",
+		//	Aliases:     []string{"dg"},
+		//	Usage:       "开发调试用",
+		//	Description: "",
+		//	Category:    "debug",
+		//	Before:      cmder.ReloadConfigFunc,
+		//	Action: func(c *cli.Context) error {
+		//		os.Setenv(config.EnvVerbose, "1")
+		//		logger.IsVerbose = true
+		//		fmt.Println("显示调试日志", logger.IsVerbose)
+		//		return nil
+		//	},
+		//	Flags: []cli.Flag{
+		//		cli.StringFlag{
+		//			Name:  "param",
+		//			Usage: "参数",
+		//		},
+		//		cli.BoolFlag{
+		//			Name:        "verbose",
+		//			Destination: &logger.IsVerbose,
+		//			EnvVar:      config.EnvVerbose,
+		//			Usage:       "显示调试信息",
+		//		},
+		//	},
+		//},
 	}
 
 	sort.Sort(cli.FlagsByName(app.Flags))

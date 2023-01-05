@@ -21,7 +21,6 @@ import (
 	"github.com/tickstep/aliyunpan/cmder/cmdtable"
 	"github.com/tickstep/aliyunpan/internal/config"
 	"github.com/tickstep/library-go/converter"
-	"github.com/tickstep/library-go/text"
 	"github.com/urfave/cli"
 	"os"
 	"strconv"
@@ -62,11 +61,14 @@ func CmdLs() cli.Command {
 	绝对路径
 	aliyunpan ls /我的资源
 
+	列出 我的资源 内的文件和目录，使用通配符
+	aliyunpan ls /我的*
+
 	详细列出 我的资源 内的文件和目录
 	aliyunpan ll /我的资源
 `,
 		Category: "阿里云盘",
-		Before:   cmder.ReloadConfigFunc,
+		Before:   ReloadConfigFunc,
 		Action: func(c *cli.Context) error {
 			if config.Config.ActiveUser() == nil {
 				fmt.Println("未登录账号")
@@ -138,13 +140,25 @@ func RunLs(driveId, targetPath string, lsOptions *LsOptions,
 	orderBy aliyunpan.FileOrderBy, orderDirection aliyunpan.FileOrderDirection) {
 	activeUser := config.Config.ActiveUser()
 	targetPath = activeUser.PathJoin(driveId, targetPath)
-	if targetPath[len(targetPath)-1] == '/' {
-		targetPath = text.Substr(targetPath, 0, len(targetPath)-1)
-	}
 
-	targetPathInfo, err := activeUser.PanClient().FileInfoByPath(driveId, targetPath)
+	files, err := matchPathByShellPattern(driveId, targetPath)
 	if err != nil {
 		fmt.Println(err)
+		return
+	}
+	var targetPathInfo *aliyunpan.FileEntity
+	if len(files) == 1 {
+		targetPathInfo = files[0]
+	} else {
+		for _, f := range files {
+			if f.IsFolder() {
+				targetPathInfo = f
+				break
+			}
+		}
+	}
+	if targetPathInfo == nil {
+		fmt.Println("目录路径不存在")
 		return
 	}
 
@@ -155,16 +169,16 @@ func RunLs(driveId, targetPath string, lsOptions *LsOptions,
 	fileListParam.OrderBy = orderBy
 	fileListParam.OrderDirection = orderDirection
 	if targetPathInfo.IsFolder() {
-		fileResult, err := activeUser.PanClient().FileListGetAll(fileListParam)
-		if err != nil {
-			fmt.Println(err)
+		fileResult, err1 := activeUser.PanClient().FileListGetAll(fileListParam, 200)
+		if err1 != nil {
+			fmt.Println(err1)
 			return
 		}
 		fileList = fileResult
 	} else {
 		fileList = append(fileList, targetPathInfo)
 	}
-	renderTable(opLs, lsOptions.Total, targetPath, fileList)
+	renderTable(opLs, lsOptions.Total, targetPathInfo.Path, fileList)
 }
 
 func renderTable(op int, isTotal bool, path string, files aliyunpan.FileList) {
@@ -186,15 +200,15 @@ func renderTable(op int, isTotal bool, path string, files aliyunpan.FileList) {
 		tb.SetColumnAlignment([]int{tablewriter.ALIGN_DEFAULT, tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_LEFT})
 		for k, file := range files {
 			if file.IsFolder() {
-				tb.Append([]string{strconv.Itoa(k), file.FileId, "-", "-", "-", file.CreatedAt, file.UpdatedAt, file.FileName + aliyunpan.PathSeparator})
+				tb.Append([]string{strconv.Itoa(k + 1), file.FileId, "-", "-", "-", file.CreatedAt, file.UpdatedAt, file.FileName + aliyunpan.PathSeparator})
 				continue
 			}
 
 			switch op {
 			case opLs:
-				tb.Append([]string{strconv.Itoa(k), file.FileId, converter.ConvertFileSize(file.FileSize, 2), file.ContentHash, strconv.FormatInt(file.FileSize, 10), file.CreatedAt, file.UpdatedAt, file.FileName})
+				tb.Append([]string{strconv.Itoa(k + 1), file.FileId, converter.ConvertFileSize(file.FileSize, 2), file.ContentHash, strconv.FormatInt(file.FileSize, 10), file.CreatedAt, file.UpdatedAt, file.FileName})
 			case opSearch:
-				tb.Append([]string{strconv.Itoa(k), file.FileId, converter.ConvertFileSize(file.FileSize, 2), file.ContentHash, strconv.FormatInt(file.FileSize, 10), file.CreatedAt, file.UpdatedAt, file.Path})
+				tb.Append([]string{strconv.Itoa(k + 1), file.FileId, converter.ConvertFileSize(file.FileSize, 2), file.ContentHash, strconv.FormatInt(file.FileSize, 10), file.CreatedAt, file.UpdatedAt, file.Path})
 			}
 		}
 		fN, dN = files.Count()
@@ -204,26 +218,22 @@ func renderTable(op int, isTotal bool, path string, files aliyunpan.FileList) {
 		tb.SetColumnAlignment([]int{tablewriter.ALIGN_DEFAULT, tablewriter.ALIGN_RIGHT, tablewriter.ALIGN_LEFT, tablewriter.ALIGN_LEFT})
 		for k, file := range files {
 			if file.IsFolder() {
-				tb.Append([]string{strconv.Itoa(k), "-", file.UpdatedAt, file.FileName + aliyunpan.PathSeparator})
+				tb.Append([]string{strconv.Itoa(k + 1), "-", file.UpdatedAt, file.FileName + aliyunpan.PathSeparator})
 				continue
 			}
 
 			switch op {
 			case opLs:
-				tb.Append([]string{strconv.Itoa(k), converter.ConvertFileSize(file.FileSize, 2), file.UpdatedAt, file.FileName})
+				tb.Append([]string{strconv.Itoa(k + 1), converter.ConvertFileSize(file.FileSize, 2), file.UpdatedAt, file.FileName})
 			case opSearch:
-				tb.Append([]string{strconv.Itoa(k), converter.ConvertFileSize(file.FileSize, 2), file.UpdatedAt, file.Path})
+				tb.Append([]string{strconv.Itoa(k + 1), converter.ConvertFileSize(file.FileSize, 2), file.UpdatedAt, file.Path})
 			}
 		}
 		fN, dN = files.Count()
 		tb.Append([]string{"", "总: " + converter.ConvertFileSize(files.TotalSize(), 2), "", fmt.Sprintf("文件总数: %d, 目录总数: %d", fN, dN)})
 	}
-
+	fmt.Printf("\n当前目录: %s\n", path)
+	fmt.Printf("----\n")
 	tb.Render()
-
-	if fN+dN >= 60 {
-		fmt.Printf("\n当前目录: %s\n", path)
-	}
-
 	fmt.Printf("----\n")
 }

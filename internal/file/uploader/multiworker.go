@@ -15,8 +15,9 @@ package uploader
 
 import (
 	"context"
-	"github.com/tickstep/aliyunpan/internal/waitgroup"
 	"github.com/oleiade/lane"
+	"github.com/tickstep/aliyunpan/internal/waitgroup"
+	"github.com/tickstep/library-go/logger"
 	"github.com/tickstep/library-go/requester"
 	"os"
 	"strconv"
@@ -27,7 +28,7 @@ type (
 		id         int
 		partOffset int64
 		splitUnit  SplitUnit
-		uploadDone   bool
+		uploadDone bool
 	}
 
 	workerList []*worker
@@ -66,78 +67,83 @@ func (muer *MultiUploader) upload() (uperr error) {
 	uploadClient.SetKeepAlive(true)
 
 	for {
-		// 阿里云盘只支持分片按顺序上传，这里正常应该是parallel = 1
+		// 阿里云盘只支持分片按顺序上传，这里必须是parallel = 1
 		wg := waitgroup.NewWaitGroup(muer.config.Parallel)
-		for {
-			e := uploadDeque.Shift()
-			if e == nil { // 任务为空
+		wg.AddDelta()
+
+		uperr = nil
+		e := uploadDeque.Shift()
+		if e == nil { // 任务为空
+			break
+		}
+
+		wer := e.(*worker)
+		go func() { // 异步上传
+			defer wg.Done()
+
+			var (
+				ctx, cancel = context.WithCancel(context.Background())
+				doneChan    = make(chan struct{})
+				uploadDone  bool
+				terr        error
+			)
+			go func() {
+				if !wer.uploadDone {
+					logger.Verboseln("begin to upload part: " + strconv.Itoa(wer.id))
+					uploadDone, terr = muer.multiUpload.UploadFile(ctx, int(wer.id), wer.partOffset, wer.splitUnit.Range().End, wer.splitUnit, uploadClient)
+				} else {
+					uploadDone = true
+				}
+				close(doneChan)
+			}()
+			select { // 监听上传进程，循环阻塞
+			case <-muer.canceled:
+				cancel()
+				return
+			case <-doneChan:
+				// continue
+				logger.Verboseln("multiUpload worker upload file done")
+			}
+			cancel()
+			if terr != nil {
+				logger.Verboseln("upload file part err: %+v", terr)
+				if me, ok := terr.(*MultiError); ok {
+					if me.Terminated { // 终止
+						muer.closeCanceledOnce.Do(func() { // 只关闭一次
+							close(muer.canceled)
+						})
+						uperr = me.Err
+						return
+					} else if me.NeedStartOver {
+						logger.Verboseln("upload start over: %d\n", wer.id)
+						// 从头开始上传
+						muer.closeCanceledOnce.Do(func() { // 只关闭一次
+							close(muer.canceled)
+						})
+						uperr = me.Err
+						return
+					}
+				}
+
+				logger.Verboseln("upload err: %s, id: %d\n", terr, wer.id)
+				wer.splitUnit.Seek(0, os.SEEK_SET)
+				uploadDeque.Prepend(wer) // 放回上传队列首位
+				return
+			}
+			wer.uploadDone = uploadDone
+
+			// 通知更新
+			if muer.updateInstanceStateChan != nil && len(muer.updateInstanceStateChan) < cap(muer.updateInstanceStateChan) {
+				muer.updateInstanceStateChan <- struct{}{}
+			}
+		}()
+		wg.Wait()
+		if uperr != nil {
+			if uperr == UploadPartNotSeq {
+				// 分片出现乱序，需要重新上传，取消本次所有剩余的分片的上传
 				break
 			}
-
-			wer := e.(*worker)
-			wg.AddDelta()
-			go func() {
-				defer wg.Done()
-
-				var (
-					ctx, cancel = context.WithCancel(context.Background())
-					doneChan    = make(chan struct{})
-					uploadDone  bool
-					terr        error
-				)
-				go func() {
-					if !wer.uploadDone {
-						uploaderVerbose.Info("begin to upload part: " + strconv.Itoa(wer.id))
-						uploadDone, terr = muer.multiUpload.UploadFile(ctx, int(wer.id), wer.partOffset, wer.splitUnit.Range().End, wer.splitUnit, uploadClient)
-					} else {
-						uploadDone = true
-					}
-					close(doneChan)
-				}()
-				select {
-				case <-muer.canceled:
-					cancel()
-					return
-				case <-doneChan:
-					// continue
-					uploaderVerbose.Info("multiUpload worker upload file done")
-				}
-				cancel()
-				if terr != nil {
-					if me, ok := terr.(*MultiError); ok {
-						if me.Terminated { // 终止
-							muer.closeCanceledOnce.Do(func() { // 只关闭一次
-								close(muer.canceled)
-							})
-							uperr = me.Err
-							return
-						} else if me.NeedStartOver {
-							uploaderVerbose.Warnf("upload start over: %d\n", wer.id)
-							// 从头开始上传
-							uploadDeque = lane.NewDeque()
-							for _,item := range muer.workers {
-								item.uploadDone = false
-								uploadDeque.Append(item)
-							}
-							return
-						}
-					}
-
-					uploaderVerbose.Warnf("upload err: %s, id: %d\n", terr, wer.id)
-					wer.splitUnit.Seek(0, os.SEEK_SET)
-					uploadDeque.Append(wer)
-					return
-				}
-				wer.uploadDone = uploadDone
-
-				// 通知更新
-				if muer.updateInstanceStateChan != nil && len(muer.updateInstanceStateChan) < cap(muer.updateInstanceStateChan) {
-					muer.updateInstanceStateChan <- struct{}{}
-				}
-			}()
 		}
-		wg.Wait()
-
 		// 没有任务了
 		if uploadDeque.Size() == 0 {
 			break
@@ -165,11 +171,11 @@ func (muer *MultiUploader) upload() (uperr error) {
 	if allSuccess {
 		e := muer.multiUpload.CommitFile()
 		if e != nil {
-			uploaderVerbose.Warn("upload file commit failed: " + e.Error())
+			logger.Verboseln("upload file commit failed: " + e.Error())
 			return e
 		}
 	} else {
-		uploaderVerbose.Warn("upload file not all success: " + muer.UploadOpEntity.FileId)
+		logger.Verboseln("upload file not all success: " + muer.UploadOpEntity.FileId)
 	}
 
 	return

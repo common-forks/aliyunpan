@@ -15,6 +15,7 @@ package panupload
 
 import (
 	"fmt"
+	"github.com/tickstep/aliyunpan/internal/log"
 	"github.com/tickstep/aliyunpan/internal/plugins"
 	"github.com/tickstep/library-go/logger"
 	"os"
@@ -49,7 +50,6 @@ type (
 		SavePath          string // 保存路径
 		DriveId           string // 网盘ID，例如：文件网盘，相册网盘
 		FolderCreateMutex *sync.Mutex
-		FolderSyncDb      SyncDb //文件备份状态数据库
 
 		PanClient         *aliyunpan.PanClient
 		UploadingDatabase *UploadingDatabase // 数据库
@@ -72,6 +72,9 @@ type (
 
 		// 全局速度统计
 		GlobalSpeedsStat *speeds.Speeds
+
+		// 上传文件记录器
+		FileRecorder *log.FileRecorder
 	}
 )
 
@@ -119,11 +122,11 @@ func (utu *UploadTaskUnit) prepareFile() {
 		return
 	}
 
-	if utu.LocalFileChecksum.Length > MaxRapidUploadSize {
-		fmt.Printf("[%s] 文件超过20GB, 无法使用秒传功能, 跳过秒传...\n", utu.taskInfo.Id())
-		utu.Step = StepUploadUpload
-		return
-	}
+	//if utu.LocalFileChecksum.Length > MaxRapidUploadSize {
+	//	fmt.Printf("[%s] 文件超过20GB, 无法使用秒传功能, 跳过秒传...\n", utu.taskInfo.Id())
+	//	utu.Step = StepUploadUpload
+	//	return
+	//}
 	// 下一步: 秒传
 	utu.Step = StepUploadRapidUpload
 }
@@ -218,8 +221,12 @@ func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 		}
 		return
 	})
-	muer.Execute()
-
+	er := muer.Execute()
+	if er != nil {
+		result.ResultMessage = StrUploadFailed
+		result.NeedRetry = true
+		result.Err = er
+	}
 	return
 }
 
@@ -237,28 +244,15 @@ func (utu *UploadTaskUnit) OnSuccess(lastRunResult *taskframework.TaskUnitRunRes
 	// 执行插件
 	utu.pluginCallback("success")
 
-	//文件上传成功
-	if utu.FolderSyncDb == nil || lastRunResult == ResultLocalFileNotUpdated { //不需要更新数据库
-		return
+	// 上传文件数据记录
+	if config.Config.FileRecordConfig == "1" {
+		utu.FileRecorder.Append(&log.FileRecordItem{
+			Status:   "成功",
+			TimeStr:  utils.NowTimeStr(),
+			FileSize: utu.LocalFileChecksum.LocalFileMeta.Length,
+			FilePath: utu.LocalFileChecksum.Path.LogicPath,
+		})
 	}
-	ufm := &UploadedFileMeta{
-		IsFolder: false,
-		SHA1:     utu.LocalFileChecksum.SHA1,
-		ModTime:  utu.LocalFileChecksum.ModTime,
-		Size:     utu.LocalFileChecksum.Length,
-	}
-
-	if utu.LocalFileChecksum.UploadOpEntity != nil {
-		ufm.FileId = utu.LocalFileChecksum.UploadOpEntity.FileId
-		ufm.ParentId = utu.LocalFileChecksum.UploadOpEntity.ParentFileId
-	} else {
-		efi, _ := utu.PanClient.FileInfoByPath(utu.DriveId, utu.SavePath)
-		if efi != nil {
-			ufm.FileId = efi.FileId
-			ufm.ParentId = efi.ParentFileId
-		}
-	}
-	utu.FolderSyncDb.Put(utu.SavePath, ufm)
 }
 
 func (utu *UploadTaskUnit) OnFailed(lastRunResult *taskframework.TaskUnitRunResult) {
@@ -267,11 +261,14 @@ func (utu *UploadTaskUnit) OnFailed(lastRunResult *taskframework.TaskUnitRunResu
 }
 
 func (utu *UploadTaskUnit) pluginCallback(result string) {
+	if utu.LocalFileChecksum == nil {
+		return
+	}
 	pluginManger := plugins.NewPluginManager(config.GetPluginDir())
 	plugin, _ := pluginManger.GetPlugin()
-	_, fileName := filepath.Split(utu.LocalFileChecksum.Path)
+	_, fileName := filepath.Split(utu.LocalFileChecksum.Path.LogicPath)
 	pluginParam := &plugins.UploadFileFinishParams{
-		LocalFilePath:      utu.LocalFileChecksum.Path,
+		LocalFilePath:      utu.LocalFileChecksum.Path.LogicPath,
 		LocalFileName:      fileName,
 		LocalFileSize:      utu.LocalFileChecksum.LocalFileMeta.Length,
 		LocalFileType:      "file",
@@ -287,9 +284,6 @@ func (utu *UploadTaskUnit) pluginCallback(result string) {
 		logger.Verboseln("插件UploadFileFinishCallback调用成功")
 	}
 }
-
-var ResultLocalFileNotUpdated = &taskframework.TaskUnitRunResult{ResultCode: 1, Succeed: true, ResultMessage: "本地文件未更新，无需上传！"}
-var ResultUpdateLocalDatabase = &taskframework.TaskUnitRunResult{ResultCode: 2, Succeed: true, ResultMessage: "本地文件和云端文件MD5一致，无需上传！"}
 
 func (utu *UploadTaskUnit) OnComplete(lastRunResult *taskframework.TaskUnitRunResult) {
 	// 任务结束，可能成功也可能失败
@@ -312,7 +306,7 @@ func (utu *UploadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 	timeStart := time.Now()
 	result = &taskframework.TaskUnitRunResult{}
 
-	fmt.Printf("[%s] %s 准备上传: %s => %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), utu.LocalFileChecksum.Path, utu.SavePath)
+	fmt.Printf("[%s] %s 准备上传: %s => %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), utu.LocalFileChecksum.Path.LogicPath, utu.SavePath)
 
 	defer func() {
 		var msg string
@@ -336,14 +330,11 @@ func (utu *UploadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 	var contentHashName string
 	var checkNameMode string
 	var saveFilePath string
-	var testFileMeta = &UploadedFileMeta{}
 	var uploadOpEntity *aliyunpan.CreateFileUploadResult
 	var proofCode = ""
 	var localFileInfo os.FileInfo
 	var localFile *os.File
-	timeStart2 := time.Now()
-	timeStart3 := time.Now()
-	timeStart4 := time.Now()
+	var newBlockSize int64
 
 	switch utu.Step {
 	case StepUploadPrepareUpload:
@@ -356,50 +347,35 @@ func (utu *UploadTaskUnit) Run() (result *taskframework.TaskUnitRunResult) {
 
 StepUploadPrepareUpload:
 	// 创建上传任务
-	if utu.FolderSyncDb != nil {
-		//启用了备份功能，强制使用覆盖同名文件功能
-		utu.IsOverwrite = true
-		testFileMeta = utu.FolderSyncDb.Get(utu.SavePath)
-	}
-
 	// 创建云盘文件夹
-	timeStart2 = time.Now()
-	// utu.FolderCreateMutex.Lock()
 	saveFilePath = path.Dir(utu.SavePath)
 	if saveFilePath != "/" {
+		utu.FolderCreateMutex.Lock()
 		fmt.Printf("[%s] %s 正在检测和创建云盘文件夹: %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), saveFilePath)
-		//同步功能先尝试从数据库获取
-		if utu.FolderSyncDb != nil {
-			timeStart3 = time.Now()
-			utu.FolderCreateMutex.Lock()
-			if test := utu.FolderSyncDb.Get(saveFilePath); test.FileId != "" && test.IsFolder {
-				rs = &aliyunpan.MkdirResult{FileId: test.FileId}
-			}
-			utu.FolderCreateMutex.Unlock()
-			logger.Verbosef("[%s] %s 检测和创建云盘文件夹完毕[from db], 耗时 %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), utils.ConvertTime(time.Now().Sub(timeStart3)))
-		}
-		if rs == nil {
-			timeStart4 = time.Now()
+		fe, apierr1 := utu.PanClient.FileInfoByPath(utu.DriveId, saveFilePath)
+		time.Sleep(1 * time.Second)
+		if apierr1 != nil && apierr1.Code == apierror.ApiCodeFileNotFoundCode {
 			logger.Verbosef("[%s] %s 创建云盘文件夹: %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), saveFilePath)
-			utu.FolderCreateMutex.Lock()
 			// rs, apierr = utu.PanClient.MkdirRecursive(utu.DriveId, "", "", 0, strings.Split(path.Clean(saveFilePath), "/"))
 			// 可以直接创建的，不用循环创建
 			rs, apierr = utu.PanClient.Mkdir(utu.DriveId, "root", saveFilePath)
-			utu.FolderCreateMutex.Unlock()
 			if apierr != nil || rs.FileId == "" {
 				result.Err = apierr
 				result.ResultMessage = "创建云盘文件夹失败"
+				utu.FolderCreateMutex.Unlock()
 				return
 			}
-			logger.Verbosef("[%s] %s 创建云盘文件夹, 耗时 %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), utils.ConvertTime(time.Now().Sub(timeStart4)))
+			logger.Verbosef("[%s] %s 创建云盘文件夹成功\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"))
+		} else {
+			rs = &aliyunpan.MkdirResult{}
+			rs.FileId = fe.FileId
 		}
+		utu.FolderCreateMutex.Unlock()
 	} else {
 		rs = &aliyunpan.MkdirResult{}
 		rs.FileId = ""
 	}
-	// time.Sleep(time.Duration(2) * time.Second)
-	// utu.FolderCreateMutex.Unlock()
-	logger.Verbosef("[%s] %s 检测和创建云盘文件夹完毕, 耗时 %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), utils.ConvertTime(time.Now().Sub(timeStart2)))
+	time.Sleep(time.Duration(2) * time.Second)
 
 	sha1Str = ""
 	proofCode = ""
@@ -407,18 +383,15 @@ StepUploadPrepareUpload:
 	checkNameMode = "auto_rename"
 	if !utu.NoRapidUpload {
 		// 计算文件SHA1
-		fmt.Printf("[%s] %s 正在计算文件SHA1: %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), utu.LocalFileChecksum.Path)
+		fmt.Printf("[%s] %s 正在计算文件SHA1: %s\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"), utu.LocalFileChecksum.Path.LogicPath)
 		utu.LocalFileChecksum.Sum(localfile.CHECKSUM_SHA1)
-		if testFileMeta.SHA1 == utu.LocalFileChecksum.SHA1 {
-			return ResultUpdateLocalDatabase
-		}
 		sha1Str = utu.LocalFileChecksum.SHA1
 		if utu.LocalFileChecksum.Length == 0 {
 			sha1Str = aliyunpan.DefaultZeroSizeFileContentHash
 		}
 
 		// proof code
-		localFile, _ = os.Open(utu.LocalFileChecksum.Path)
+		localFile, _ = os.Open(utu.LocalFileChecksum.Path.RealPath)
 		localFileInfo, _ = localFile.Stat()
 		proofCode = aliyunpan.CalcProofCode(utu.PanClient.GetAccessToken(), rio.NewFileReaderAtLen64(localFile), localFileInfo.Size())
 		localFile.Close()
@@ -458,6 +431,13 @@ StepUploadPrepareUpload:
 		}
 	}
 
+	// 自动调整BlockSize大小
+	newBlockSize = utils.ResizeUploadBlockSize(utu.LocalFileChecksum.Length, utu.BlockSize)
+	if newBlockSize != utu.BlockSize {
+		logger.Verboseln("resize upload block size to: " + converter.ConvertFileSize(newBlockSize, 2))
+		utu.BlockSize = newBlockSize
+	}
+
 	// 创建上传任务
 	appCreateUploadFileParam = &aliyunpan.CreateFileUploadParam{
 		DriveId:         utu.DriveId,
@@ -476,6 +456,11 @@ StepUploadPrepareUpload:
 	if apierr != nil {
 		result.Err = apierr
 		result.ResultMessage = "创建上传任务失败：" + apierr.Error()
+		if apierr.Code == apierror.ApiCodeTooManyRequests || apierr.Code == apierror.ApiCodeBadGateway {
+			logger.Verboseln("create upload file error: " + result.ResultMessage)
+			// 重试
+			result.NeedRetry = true
+		}
 		return
 	}
 
@@ -495,6 +480,15 @@ stepUploadRapidUpload:
 stepUploadUpload:
 	// 正常上传流程
 	uploadResult := utu.upload()
-
+	if uploadResult != nil && uploadResult.Err != nil {
+		if uploadResult.Err == uploader.UploadPartNotSeq {
+			fmt.Printf("[%s] %s 文件分片上传顺序错误，开始重新上传文件\n", utu.taskInfo.Id(), time.Now().Format("2006-01-02 15:04:06"))
+			// 需要重新从0开始上传
+			uploadResult = nil
+			utu.LocalFileChecksum.UploadOpEntity = nil
+			utu.state = nil
+			goto StepUploadPrepareUpload
+		}
+	}
 	return uploadResult
 }

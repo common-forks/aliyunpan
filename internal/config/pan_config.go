@@ -19,6 +19,7 @@ import (
 	"github.com/tickstep/aliyunpan-api/aliyunpan"
 	"github.com/tickstep/aliyunpan/cmder/cmdutil"
 	"github.com/tickstep/aliyunpan/cmder/cmdutil/jsonhelper"
+	"github.com/tickstep/aliyunpan/internal/utils"
 	"github.com/tickstep/aliyunpan/library/homedir"
 	"github.com/tickstep/library-go/logger"
 	"github.com/tickstep/library-go/requester"
@@ -54,6 +55,9 @@ const (
 	// DefaultTokenServiceWebHost 默认的token服务
 	DefaultTokenServiceWebHost = "https://api.tickstep.com"
 	//DefaultTokenServiceWebHost = "http://localhost:8977"
+
+	// DefaultVideoFileExtensions 默认的视频文件后缀
+	DefaultVideoFileExtensions = "mp4,flv,mkv,mov,rm,rmvb,wmv,wma,mv,asf,asx,mpg,mpeg,mpe,3gp,m4v,avi,vob"
 )
 
 var (
@@ -64,6 +68,9 @@ var (
 	Config = NewConfig(configFilePath)
 
 	AppVersion string
+
+	// IsAppInCliMode 是否在交互模式
+	IsAppInCliMode = false
 )
 
 type UpdateCheckInfo struct {
@@ -92,6 +99,9 @@ type PanConfig struct {
 	Proxy           string          `json:"proxy"`      // 代理
 	LocalAddrs      string          `json:"localAddrs"` // 本地网卡地址
 	UpdateCheckInfo UpdateCheckInfo `json:"updateCheckInfo"`
+
+	VideoFileExtensions string `json:"videoFileExtensions"`
+	FileRecordConfig    string `json:"fileRecordConfig"` // 上传、下载、同步文件的记录，包括失败和成功的
 
 	configFilePath string
 	configFile     *os.File
@@ -195,8 +205,8 @@ func (c *PanConfig) lazyOpenConfigFile() (err error) {
 	}
 
 	c.fileMu.Lock()
-	os.MkdirAll(filepath.Dir(c.configFilePath), 0700)
-	c.configFile, err = os.OpenFile(c.configFilePath, os.O_CREATE|os.O_RDWR, 0600)
+	os.MkdirAll(filepath.Dir(c.configFilePath), 0755)
+	c.configFile, err = os.OpenFile(c.configFilePath, os.O_CREATE|os.O_RDWR, 0755)
 	c.fileMu.Unlock()
 
 	if err != nil {
@@ -262,6 +272,8 @@ func (c *PanConfig) initDefaultConfig() {
 		}
 	}
 	c.ConfigVer = ConfigVersion
+	c.VideoFileExtensions = DefaultVideoFileExtensions
+	c.FileRecordConfig = "1" // 默认开启
 }
 
 // GetConfigDir 获取配置路径
@@ -308,8 +320,40 @@ func GetConfigDir() string {
 	return configDir
 }
 
+// GetPluginDir 获取插件文件夹路径
 func GetPluginDir() string {
 	return strings.TrimSuffix(GetConfigDir(), "/") + "/plugin"
+}
+
+// GetPluginKvFile 获取插件KV键值对存储文件
+func GetPluginKvFile() string {
+	return GetPluginDir() + "/kv.bolt"
+}
+
+// GetSyncDriveDir 获取同步备份的文件夹路径
+func GetSyncDriveDir() string {
+	return strings.TrimSuffix(GetConfigDir(), "/") + "/sync_drive"
+}
+
+// GetLogDir 获取日志文件目录路径
+func GetLogDir() string {
+	return strings.TrimSuffix(GetConfigDir(), "/") + "/logs"
+}
+
+// GetLogFilePath 获取日志文件路径
+func GetLogFilePath() string {
+	dirPath := GetLogDir()
+	if b, e := utils.PathExists(dirPath); e == nil {
+		if !b {
+			os.MkdirAll(dirPath, 0755)
+		}
+	}
+	return dirPath + "/" + "aliyunpan_verbose.log"
+}
+
+// GetLockerDir 获取文件锁路径
+func GetLockerDir() string {
+	return strings.TrimSuffix(GetConfigDir(), "/")
 }
 
 func (c *PanConfig) ActiveUser() *PanUser {
@@ -432,4 +476,19 @@ func (c *PanConfig) HTTPClient(ua string) *requester.HTTPClient {
 		client.SetUserAgent(ua)
 	}
 	return client
+}
+
+func (c *PanConfig) GetVideoExtensionList() []string {
+	if c.VideoFileExtensions == "" {
+		return []string{}
+	}
+	exts := strings.Split(c.VideoFileExtensions, ",")
+	r := []string{}
+	for _, ex := range exts {
+		ex = strings.TrimSpace(ex)
+		if ex != "" {
+			r = append(r, strings.ToLower(ex))
+		}
+	}
+	return r
 }

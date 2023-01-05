@@ -16,7 +16,6 @@ package command
 import (
 	"fmt"
 	"github.com/tickstep/aliyunpan-api/aliyunpan"
-	"github.com/tickstep/aliyunpan/cmder"
 	"github.com/tickstep/aliyunpan/cmder/cmdliner"
 	"github.com/tickstep/aliyunpan/internal/config"
 	"github.com/tickstep/aliyunpan/internal/functions/panlogin"
@@ -42,8 +41,8 @@ func CmdLogin() cli.Command {
 		aliyunpan login -QrCode
 `,
 		Category: "阿里云盘账号",
-		Before:   cmder.ReloadConfigFunc, // 每次进行登录动作的时候需要调用刷新配置
-		After:    cmder.SaveConfigFunc,   // 登录完成需要调用保存配置
+		Before:   ReloadConfigFunc, // 每次进行登录动作的时候需要调用刷新配置
+		After:    SaveConfigFunc,   // 登录完成需要调用保存配置
 		Action: func(c *cli.Context) error {
 			refreshTokenStr := ""
 			if refreshTokenStr == "" {
@@ -93,8 +92,8 @@ func CmdLogout() cli.Command {
 		Usage:       "退出阿里帐号",
 		Description: "退出当前登录的帐号",
 		Category:    "阿里云盘账号",
-		Before:      cmder.ReloadConfigFunc,
-		After:       cmder.SaveConfigFunc,
+		Before:      ReloadConfigFunc,
+		After:       SaveConfigFunc,
 		Action: func(c *cli.Context) error {
 			if config.Config.NumLogins() == 0 {
 				fmt.Println("未设置任何帐号, 不能退出")
@@ -105,6 +104,9 @@ func CmdLogout() cli.Command {
 				confirm    string
 				activeUser = config.Config.ActiveUser()
 			)
+			if activeUser == nil {
+				return nil
+			}
 
 			if !c.Bool("y") {
 				fmt.Printf("确认退出当前帐号: %s ? (y/n) > ", activeUser.Nickname)
@@ -144,10 +146,11 @@ func RunLogin(useQrCodeLogin bool, refreshToken string) (tokenId, refreshTokenSt
 		// handler waiting
 		line := cmdliner.NewLiner()
 		var qrCodeLoginResult *panlogin.QRCodeLoginResult
+		queryResult := true
 		defer line.Close()
 
 		go func() {
-			for {
+			for queryResult {
 				time.Sleep(3 * time.Second)
 				qr, er := h.GetQRCodeLoginResult(qrCodeUrlResult.TokenId)
 				if er != nil {
@@ -166,6 +169,7 @@ func RunLogin(useQrCodeLogin bool, refreshToken string) (tokenId, refreshTokenSt
 
 		line.State.Prompt("请在浏览器里面完成扫码登录，然后再按Enter键继续...")
 		if qrCodeLoginResult == nil {
+			queryResult = false
 			return "", "", aliyunpan.WebLoginToken{}, fmt.Errorf("二维码登录失败")
 		}
 
@@ -178,6 +182,6 @@ func RunLogin(useQrCodeLogin bool, refreshToken string) (tokenId, refreshTokenSt
 		tokenId = qrCodeUrlResult.TokenId
 	}
 
-	refreshTokenStr, webToken, error = cmder.DoLoginHelper(refreshToken)
+	refreshTokenStr, webToken, error = DoLoginHelper(refreshToken)
 	return
 }
